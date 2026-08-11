@@ -12,7 +12,7 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
-      - name: Print reward counters
+      - name: Print reward counters and breakdowns
         shell: bash
         run: |
           set -euo pipefail
@@ -21,29 +21,15 @@ jobs:
           from decimal import Decimal, getcontext
           getcontext().prec=80
           address='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
-          urls=[
-            f'https://api.merkl.xyz/v4/users/{address}/rewards?chainId=1&reloadChainId=1',
-            f'https://api.merkl.xyz/v4/users/{address}/rewards?chainId=1',
-            f'https://api.merkl.fr/v4/users/{address}/rewards?chainId=1&reloadChainId=1',
-            f'https://api-merkl.angle.money/v4/users/{address}/rewards?chainId=1&reloadChainId=1',
-          ]
-          data=None
-          for url in urls:
-            try:
-              req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
-              with urllib.request.urlopen(req,timeout=45) as r:
-                raw=json.loads(r.read())
-                print('ENDPOINT|%s|status=%s' % (url,r.status))
-                if isinstance(raw,list): data=raw; break
-            except Exception as exc: print('ENDPOINT_FAIL|%s|%r' % (url,exc))
-          if data is None: raise SystemExit('no Merkl response')
-          count=0
+          url=f'https://api.merkl.xyz/v4/users/{address}/rewards?chainId=1&reloadChainId=1'
+          req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
+          with urllib.request.urlopen(req,timeout=45) as r: data=json.loads(r.read()); print('ENDPOINT|status=%s' % r.status)
           for chain in data:
             for reward in chain.get('rewards',[]):
-              token=reward.get('token') or {}; d=int(token.get('decimals') or 18); scale=Decimal(10)**d
+              token=reward.get('token') or {}; symbol=token.get('symbol'); d=int(token.get('decimals') or 18); scale=Decimal(10)**d
               amount=Decimal(str(reward.get('amount') or 0)); claimed=Decimal(str(reward.get('claimed') or 0)); pending=Decimal(str(reward.get('pending') or 0))
-              print('REWARD|symbol=%s|token=%s|credited=%s|claimed=%s|claimable=%s|pending=%s|including_pending=%s|price=%s|breakdown_count=%s' % (
-                token.get('symbol'),token.get('address'),amount/scale,claimed/scale,(amount-claimed)/scale,pending/scale,(amount+pending)/scale,token.get('price'),len(reward.get('breakdowns') or [])))
-              count+=1
-          print('REWARD_COUNT|%s' % count)
+              print('REWARD|symbol=%s|credited=%s|claimed=%s|claimable=%s|pending=%s|price=%s' % (symbol,amount/scale,claimed/scale,(amount-claimed)/scale,pending/scale,token.get('price')))
+              if symbol in ('1INCH','USDC'):
+                for i,b in enumerate(reward.get('breakdowns') or []):
+                  print('BREAKDOWN|symbol=%s|index=%s|json=%s' % (symbol,i,json.dumps(b,ensure_ascii=False,separators=(',',':'))))
           PY

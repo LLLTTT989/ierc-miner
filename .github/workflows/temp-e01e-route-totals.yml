@@ -1,0 +1,74 @@
+name: Temporary E01e route totals
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-e01e-route-totals.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests,time
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          getcontext().prec=100
+          B='https://eth.blockscout.com/api/v2';CUT='2026-08-04T00:00:00.000000Z'
+          T='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950';A6='0xa6ae8e0d2e294018dd3e36caf6c828b79236f71d';F5='0xf5947f530b2a67b3d9ef211c10abba06c6c3a836';X45='0x456b99ff0a1459a9016a37b41cce5937dbc8bd8e';X00='0x00f3ac32a2d174606927eb17a5d0d221c13e434a';X619='0x619292ee01ed59285bcdd7f4b9c5fa662e15f8a3';BIN='0x28c6c06298d514db089934071355e5743bf21d60'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):
+            for i in range(6):
+              r=s.get(B+path,params=p,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def pages(addr,maxp=80):
+            base={'type':'ERC-20'};q=base.copy();o=[]
+            for _ in range(maxp):
+              d=g('/addresses/'+addr+'/token-transfers',q);it=d.get('items') or []
+              if not it:break
+              oldest=None
+              for x in it:
+                st=x.get('timestamp');oldest=st or oldest
+                if not st or st>=CUT:o.append(x)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+              q={**base,**n}
+            return o
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def amt(x):
+            q=x.get('total') or {};t=x.get('token') or {};return Decimal(str(q.get('value') or 0))/(Decimal(10)**int(q.get('decimals',t.get('decimals',0)) or 0))
+          def sy(x):return str((x.get('token') or {}).get('symbol') or '?')
+          def real_symbol(x):
+            # Reject common address-poisoning lookalikes by token contract for core assets.
+            a=str((x.get('token') or {}).get('address_hash') or '').lower();sym=sy(x)
+            known={'0x111111111117dc0aa78b770fa6a738034120c302':'1INCH','0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':'USDC','0xdac17f958d2ee523a2206206994597c13d831ec7':'USDT','0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2':'WETH','0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0':'WSTETH','0x68749665ff8d2d112fa859aa293f07a622782f38':'XAUT','0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':'UNI'}
+            return known.get(a,sym)
+          cache={}
+          def allx(a):
+            if a not in cache:cache[a]=pages(a)
+            return cache[a]
+          def route(name,src,dst):
+            rows=[x for x in allx(dst) if h(x.get('from'))==src and h(x.get('to'))==dst]
+            sums=defaultdict(Decimal)
+            for x in rows:sums[real_symbol(x)]+=amt(x)
+            print('ROUTE|name=%s|from=%s|to=%s|tx_count=%s|tokens=%s'%(name,src,dst,len({x.get('transaction_hash') for x in rows}),','.join('%s=%s'%z for z in sorted(sums.items())) or 'none'))
+            for x in sorted(rows,key=lambda z:z.get('timestamp') or ''):print('ROUTE_ITEM|name=%s|timestamp=%s|symbol=%s|amount=%s|tx=%s'%(name,x.get('timestamp'),real_symbol(x),amt(x),x.get('transaction_hash')))
+          route('TARGET_TO_A6',T,A6)
+          route('A6_TO_BINANCE',A6,BIN)
+          route('TARGET_TO_456B',T,X45)
+          route('456B_TO_619',X45,X619)
+          route('TARGET_TO_00F3',T,X00)
+          route('00F3_RETURN_TARGET',X00,T)
+          route('TARGET_TO_F594',T,F5)
+          PY

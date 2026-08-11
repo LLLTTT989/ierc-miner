@@ -1,0 +1,96 @@
+name: Temporary follow E01e downstream
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-follow-e01e-third.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trace downstream wallets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests 'web3>=7,<8'
+          python3 - <<'PY'
+          import requests,time
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          from web3 import Web3
+          getcontext().prec=90
+          ADDRS=['0x619292ee01ed59285bcdd7f4b9c5fa662e15f8a3','0x00f3ac32a2d174606927eb17a5d0d221c13e434a']
+          CUT='2026-08-08T00:00:00.000000Z';B='https://eth.blockscout.com/api/v2'
+          TOKENS={
+            'USDT':('0xdac17f958d2ee523a2206206994597c13d831ec7',6),
+            'USDC':('0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',6),
+            'WETH':('0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',18),
+            '1INCH':('0x111111111117dc0aa78b770fa6a738034120c302',18),
+            'XAUT':('0x68749665ff8d2d112fa859aa293f07a622782f38',6),
+          }
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):
+            for i in range(5):
+              r=s.get(B+path,params=p,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def pages(path,p=None,maxp=50):
+            base=dict(p or {});q=base.copy();o=[]
+            for _ in range(maxp):
+              d=g(path,q);it=d.get('items') or []
+              if not it:break
+              oldest=None
+              for x in it:
+                st=x.get('timestamp');oldest=st or oldest
+                if not st or st>=CUT:o.append(x)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+              q={**base,**n}
+            return o
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def lab(x):
+            x=x or {};z=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):z.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for y in x.get(k) or []:
+                if isinstance(y,dict):
+                  v=y.get('display_name') or y.get('name') or y.get('label')
+                  if v:z.append(str(v))
+            return ';'.join(dict.fromkeys(z)) or '-'
+          def amt(x):
+            q=x.get('total') or {};t=x.get('token') or {};return Decimal(str(q.get('value') or 0))/(Decimal(10)**int(q.get('decimals',t.get('decimals',0)) or 0))
+          def rate(x):
+            try:return Decimal(str((x.get('token') or {}).get('exchange_rate') or 0))
+            except:return Decimal(0)
+          def sy(x):return str((x.get('token') or {}).get('symbol') or '?')
+          def j(st):return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST') if st else '-'
+          w3=None
+          for u in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:c=Web3(Web3.HTTPProvider(u,request_kwargs={'timeout':60}));_=c.eth.block_number;w3=c;print('RPC|%s|latest=%s'%(u,c.eth.block_number));break
+            except Exception as e:print('RPC_FAIL|%s|%r'%(u,e))
+          ERC=[{'type':'function','name':'balanceOf','stateMutability':'view','inputs':[{'name':'account','type':'address'}],'outputs':[{'type':'uint256'}]}]
+          for src in ADDRS:
+            info=g('/addresses/'+src);print('ADDRESS|address=%s|contract=%s|label=%s|eth=%s'%(src,info.get('is_contract'),lab(info),info.get('coin_balance')))
+            if w3:
+              for sym,(ta,dec) in TOKENS.items():
+                try:raw=w3.eth.contract(address=Web3.to_checksum_address(ta),abi=ERC).functions.balanceOf(Web3.to_checksum_address(src)).call();print('RPC_BAL|address=%s|symbol=%s|amount=%s'%(src,sym,Decimal(raw)/(Decimal(10)**dec)))
+                except Exception as e:print('RPC_BAL_FAIL|address=%s|symbol=%s|error=%r'%(src,sym,e))
+            allx=pages('/addresses/'+src+'/token-transfers',{'type':'ERC-20'})
+            out=[x for x in allx if h(x.get('from'))==src]
+            inc=[x for x in allx if h(x.get('to'))==src]
+            print('FLOW|address=%s|incoming=%s|outgoing=%s'%(src,len(inc),len(out)))
+            agg=defaultdict(lambda:{'usd':Decimal(0),'tok':defaultdict(Decimal),'obj':None,'tx':set(),'first':None,'last':None})
+            for x in out:
+              to=h(x.get('to'));a=agg[to];a['usd']+=amt(x)*rate(x);a['tok'][sy(x)]+=amt(x);a['obj']=x.get('to');a['tx'].add(x.get('transaction_hash'));st=x.get('timestamp');a['first']=min(a['first'],st) if a['first'] else st;a['last']=max(a['last'],st) if a['last'] else st
+            for to,a in sorted(agg.items(),key=lambda z:z[1]['usd'],reverse=True)[:50]:print('DEST|from=%s|to=%s|contract=%s|label=%s|usd=%s|tokens=%s|txs=%s|first=%s|last=%s'%(src,to,(a['obj'] or {}).get('is_contract'),lab(a['obj']),a['usd'],','.join('%s=%s'%z for z in sorted(a['tok'].items())),len(a['tx']),j(a['first']),j(a['last'])))
+            txs=pages('/addresses/'+src+'/transactions',maxp=50)
+            for x in txs:
+              if h(x.get('from'))==src:print('TX|from=%s|jst=%s|hash=%s|to=%s|contract=%s|label=%s|method=%s|status=%s'%(src,j(x.get('timestamp')),x.get('hash'),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('method'),x.get('status')))
+          PY

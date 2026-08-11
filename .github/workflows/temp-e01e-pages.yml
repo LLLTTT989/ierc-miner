@@ -1,0 +1,68 @@
+name: Temporary E01e recent pages
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-e01e-pages.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect six recent pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests
+          from decimal import Decimal
+          from datetime import datetime,timezone,timedelta
+          T='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950';A6='0xa6ae8e0d2e294018dd3e36caf6c828b79236f71d';F5='0xf5947f530b2a67b3d9ef211c10abba06c6c3a836';B='https://eth.blockscout.com/api/v2'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):r=s.get(B+path,params=p,timeout=60);print('HTTP|%s|%s'%(r.status_code,path));r.raise_for_status();return r.json()
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def j(st):return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST') if st else '-'
+          def lab(x):
+            x=x or {};z=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):z.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for y in x.get(k) or []:
+                if isinstance(y,dict):
+                  v=y.get('display_name') or y.get('name') or y.get('label')
+                  if v:z.append(str(v))
+            return ';'.join(dict.fromkeys(z)) or '-'
+          def print_tt(prefix,q):
+            total=q.get('total') or {};tok=q.get('token') or {};dec=int(total.get('decimals',tok.get('decimals',0)) or 0);amt=Decimal(str(total.get('value') or 0))/(Decimal(10)**dec)
+            print('%s|symbol=%s|amount=%s|from=%s|to=%s|to_contract=%s|to_label=%s|tx=%s'%(prefix,tok.get('symbol'),amt,h(q.get('from')),h(q.get('to')),(q.get('to') or {}).get('is_contract'),lab(q.get('to')),q.get('transaction_hash')))
+          p={};interesting=[]
+          for page in range(1,9):
+            d=g(f'/addresses/{T}/transactions',p);items=d.get('items') or [];print('PAGE|%s|count=%s'%(page,len(items)))
+            for x in items:
+              if h(x.get('from'))!=T:continue
+              m=str(x.get('method') or '').lower()
+              if m not in ('ship','dock','approve','claim'):
+                interesting.append(x);print('ITX|page=%s|jst=%s|hash=%s|to=%s|contract=%s|label=%s|method=%s|status=%s'%(page,j(x.get('timestamp')),x.get('hash'),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('method'),x.get('status')))
+            n=d.get('next_page_params')
+            if not isinstance(n,dict) or not n:break
+            p=n
+          print('INTERESTING|%s'%len(interesting))
+          for x in interesting:
+            d=g('/transactions/'+x['hash'])
+            for q in d.get('token_transfers') or []:
+              if h(q.get('from'))==T or h(q.get('to'))==T:print_tt('ITX_TOKEN',q)
+          for dst in (A6,F5):
+            p={'type':'ERC-20','filter':'to'}
+            for page in range(1,7):
+              d=g(f'/addresses/{dst}/token-transfers',p);items=d.get('items') or []
+              for q in items:
+                if h(q.get('from'))==T and h(q.get('to'))==dst:
+                  print('ASSOC_IN|dst=%s|page=%s|jst=%s'%(dst,page,j(q.get('timestamp'))));print_tt('ASSOC_TOKEN',q)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n:break
+              p={'type':'ERC-20','filter':'to',**n}
+          PY

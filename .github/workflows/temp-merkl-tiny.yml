@@ -12,53 +12,44 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
-      - name: Decode exact recent Merkl claims
+      - name: Page all recent distributor transfers
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'web3>=7,<8'
+          python3 -m pip install --quiet requests
           python3 - <<'PY'
-          from web3 import Web3
-          from hexbytes import HexBytes
+          import requests, json
+          from urllib.parse import urlencode
           from decimal import Decimal, getcontext
-          from datetime import datetime, timezone, timedelta
           getcontext().prec=80
           TARGET='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
           DIST='0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
-          TXS=[
-            '0xa1c29d5312219294cb9b21d0416d46815978d2216aeb4ab77415575c6961219e',
-            '0x96d48d985e7fa05e481bf8fadcda8901b87b71b8b6bcaaa1625fe7ea7af08fdd',
-            '0x235c595d23c5d0420ac828ff5cbd8bfbd2b02f2cb54d055b3d4b45b81415f66c',
-            '0x68b26b3ffc6baaf52819b748c46a287909c487e823244be7211ca21c69e4a4bd',
-          ]
-          META={
-            '0x111111111117dc0aa78b770fa6a738034120c302':('1INCH',18),
-            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48':('USDC',6),
-            '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984':('UNI',18),
-          }
-          w3=None
-          for rpc in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
-            try:
-              c=Web3(Web3.HTTPProvider(rpc,request_kwargs={'timeout':60})); _=c.eth.block_number; w3=c; print('RPC|%s' % rpc); break
-            except Exception as exc: print('RPC_FAIL|%s|%r' % (rpc,exc))
-          if w3 is None: raise SystemExit('no rpc')
-          transfer=Web3.keccak(text='Transfer(address,address,uint256)').hex()
-          overall={}
-          for txh in TXS:
-            tx=w3.eth.get_transaction(txh); receipt=w3.eth.get_transaction_receipt(txh); block=w3.eth.get_block(receipt['blockNumber']); ts=int(block['timestamp'])
-            utc=datetime.fromtimestamp(ts,timezone.utc); jst=utc.astimezone(timezone(timedelta(hours=9)))
-            sums={}; rows=[]
-            for log in receipt['logs']:
-              topics=log['topics']
-              if len(topics)!=3 or topics[0].hex()!=transfer: continue
-              frm='0x'+topics[1].hex()[-40:]; to='0x'+topics[2].hex()[-40:]
-              if frm.lower()!=DIST or to.lower()!=TARGET: continue
-              token=log['address'].lower(); symbol,decimals=META.get(token,(token[:10],18)); raw=int.from_bytes(HexBytes(log['data']),'big'); amount=Decimal(raw)/(Decimal(10)**decimals)
-              sums[symbol]=sums.get(symbol,Decimal(0))+amount; overall[symbol]=overall.get(symbol,Decimal(0))+amount
-              rows.append((symbol,amount,token,int(log['logIndex'])))
-            print('CLAIM_TX|utc=%s|jst=%s|block=%s|hash=%s|status=%s|gas_used=%s' % (utc.isoformat(),jst.strftime('%Y-%m-%d %H:%M:%S JST'),receipt['blockNumber'],txh,receipt['status'],receipt['gasUsed']))
-            for symbol,total in sorted(sums.items()): print('CLAIM_TX_SUM|hash=%s|symbol=%s|amount=%s' % (txh,symbol,total))
-            for symbol,amount,token,index in rows: print('CLAIM_ITEM|hash=%s|log_index=%s|symbol=%s|amount=%s|token=%s' % (txh,index,symbol,amount,token))
-            if not rows: print('CLAIM_TX_SUM|hash=%s|none=true' % txh)
-          for symbol,total in sorted(overall.items()): print('FOUR_TX_TOTAL|symbol=%s|amount=%s' % (symbol,total))
+          base=f'https://eth.blockscout.com/api/v2/addresses/{TARGET}/token-transfers'
+          params={'type':'ERC-20'}
+          found=[]; seen=set()
+          for page in range(1,101):
+            r=requests.get(base,params=params,timeout=60,headers={'user-agent':'Mozilla/5.0','accept':'application/json'})
+            print('PAGE|%s|status=%s|url=%s' % (page,r.status_code,r.url))
+            r.raise_for_status(); data=r.json(); items=data.get('items') or []
+            if not items: break
+            oldest=None
+            for x in items:
+              stamp=x.get('timestamp'); oldest=stamp
+              frm=((x.get('from') or {}).get('hash') or '').lower(); to=((x.get('to') or {}).get('hash') or '').lower()
+              if frm!=DIST or to!=TARGET: continue
+              token=x.get('token') or {}; symbol=token.get('symbol'); total=x.get('total') or {}; raw=Decimal(str(total.get('value') or 0)); dec=int(total.get('decimals') or token.get('decimals') or 18); amount=raw/(Decimal(10)**dec)
+              key=(x.get('transaction_hash'),symbol,str(amount))
+              if key in seen: continue
+              seen.add(key); row={'timestamp':stamp,'tx':x.get('transaction_hash'),'symbol':symbol,'amount':str(amount),'token':token.get('address_hash') or token.get('address'),'block':x.get('block_number')}
+              found.append(row); print('DISTRIBUTOR_TRANSFER|%s' % json.dumps(row,ensure_ascii=False,separators=(',',':')))
+            print('PAGE_OLDEST|%s|%s' % (page,oldest))
+            nxt=data.get('next_page_params')
+            if not isinstance(nxt,dict) or not nxt: break
+            params={'type':'ERC-20',**nxt}
+            # Aqua campaign started July 28; stop once page is safely before it.
+            if oldest and oldest < '2026-07-25': break
+          print('FOUND_COUNT|%s' % len(found))
+          sums={}
+          for x in found: sums[x['symbol']]=sums.get(x['symbol'],Decimal(0))+Decimal(x['amount'])
+          for symbol,total in sorted(sums.items()): print('FOUND_SUM|symbol=%s|amount=%s' % (symbol,total))
           PY

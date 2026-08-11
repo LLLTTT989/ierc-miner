@@ -1,0 +1,71 @@
+name: Temporary follow 00f3
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-follow-00f3.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trace 00f3
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests,time
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          getcontext().prec=90
+          A='0x00f3ac32a2d174606927eb17a5d0d221c13e434a';CUT='2026-08-07T00:00:00.000000Z';B='https://eth.blockscout.com/api/v2'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):
+            for i in range(5):
+              r=s.get(B+path,params=p,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def pages(path,p=None,maxp=30):
+            base=dict(p or {});q=base.copy();o=[]
+            for _ in range(maxp):
+              d=g(path,q);it=d.get('items') or []
+              if not it:break
+              oldest=None
+              for x in it:
+                st=x.get('timestamp');oldest=st or oldest
+                if not st or st>=CUT:o.append(x)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+              q={**base,**n}
+            return o
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def lab(x):
+            x=x or {};z=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):z.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for y in x.get(k) or []:
+                if isinstance(y,dict):
+                  v=y.get('display_name') or y.get('name') or y.get('label')
+                  if v:z.append(str(v))
+            return ';'.join(dict.fromkeys(z)) or '-'
+          def amt(x):
+            q=x.get('total') or {};t=x.get('token') or {};return Decimal(str(q.get('value') or 0))/(Decimal(10)**int(q.get('decimals',t.get('decimals',0)) or 0))
+          def rate(x):
+            try:return Decimal(str((x.get('token') or {}).get('exchange_rate') or 0))
+            except:return Decimal(0)
+          def sy(x):return str((x.get('token') or {}).get('symbol') or '?')
+          def j(st):return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST') if st else '-'
+          allx=pages('/addresses/'+A+'/token-transfers',{'type':'ERC-20'});print('ROWS|%s'%len(allx))
+          for x in sorted(allx,key=lambda z:z.get('timestamp') or ''):
+            if h(x.get('from'))==A or h(x.get('to'))==A:print('FLOW|jst=%s|dir=%s|symbol=%s|amount=%s|usd=%s|from=%s|to=%s|to_contract=%s|to_label=%s|tx=%s'%(j(x.get('timestamp')),'OUT' if h(x.get('from'))==A else 'IN',sy(x),amt(x),amt(x)*rate(x),h(x.get('from')),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('transaction_hash')))
+          txs=pages('/addresses/'+A+'/transactions',maxp=30)
+          for x in sorted(txs,key=lambda z:z.get('timestamp') or ''):
+            if h(x.get('from'))==A:print('TX|jst=%s|hash=%s|to=%s|contract=%s|label=%s|method=%s|status=%s'%(j(x.get('timestamp')),x.get('hash'),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('method'),x.get('status')))
+          PY

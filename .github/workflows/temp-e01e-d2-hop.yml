@@ -47,6 +47,7 @@ jobs:
             return Decimal(str(total.get('value') or 0))/(Decimal(10)**dec)
           def sym(q):return str((q.get('token') or {}).get('symbol') or '?')
           info=g('/addresses/'+A);print('ADDRESS|contract=%s|name=%s|label=%s|coin_balance=%s'%(info.get('is_contract'),info.get('name'),lab(info),info.get('coin_balance')))
+          # Top-level sends, if any.
           p={};txs=[]
           for page in range(1,15):
             d=g(f'/addresses/{A}/transactions',p);items=d.get('items') or []
@@ -61,9 +62,22 @@ jobs:
           print('TX_COUNT|%s'%len(txs))
           for x in sorted(txs,key=lambda z:z.get('timestamp') or ''):
             print('TX|jst=%s|hash=%s|to=%s|contract=%s|label=%s|method=%s|value=%s|status=%s'%(j(x.get('timestamp')),x.get('hash'),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('method'),x.get('value'),x.get('status')))
-            d=g('/transactions/'+x['hash'])
-            for q in d.get('token_transfers') or []:
-              if h(q.get('from'))==A:print('TOKEN|jst=%s|symbol=%s|amount=%s|to=%s|contract=%s|label=%s|tx=%s'%(j(x.get('timestamp')),sym(q),amount(q),h(q.get('to')),(q.get('to') or {}).get('is_contract'),lab(q.get('to')),x.get('hash')))
+          # Token logs may be swept by a third-party top-level sender, so scan independently.
+          base={'type':'ERC-20'};p=base.copy();rows=[]
+          for page in range(1,20):
+            d=g(f'/addresses/{A}/token-transfers',p);items=d.get('items') or []
+            if not items:break
+            oldest=None
+            for q in items:
+              st=q.get('timestamp');oldest=st or oldest
+              if st and st>=CUT and h(q.get('from'))==A and amount(q)!=0:rows.append(q)
+            n=d.get('next_page_params')
+            if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+            p={**base,**n}
+          print('TOKEN_OUT_COUNT|%s'%len(rows))
+          for q in sorted(rows,key=lambda z:z.get('timestamp') or ''):
+            tx=g('/transactions/'+q.get('transaction_hash'))
+            print('TOKEN|jst=%s|symbol=%s|amount=%s|to=%s|contract=%s|label=%s|tx=%s|top_from=%s|top_to=%s|method=%s'%(j(q.get('timestamp')),sym(q),amount(q),h(q.get('to')),(q.get('to') or {}).get('is_contract'),lab(q.get('to')),q.get('transaction_hash'),h(tx.get('from')),h(tx.get('to')),tx.get('method')))
           holds=g(f'/addresses/{A}/tokens',{'type':'ERC-20'}).get('items') or []
           for x in holds:
             tok=x.get('token') or {};dec=int(tok.get('decimals') or 0);amt=Decimal(str(x.get('value') or 0))/(Decimal(10)**dec)

@@ -1,0 +1,51 @@
+name: Temporary E01e d2 RPC
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-e01e-d2-rpc.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query WETH logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'web3>=7,<8'
+          python3 - <<'PY'
+          from web3 import Web3
+          from hexbytes import HexBytes
+          from decimal import Decimal
+          from datetime import datetime,timezone,timedelta
+          A='0xd2f78dd99c9eea7af493b100cf56854646fb764a'
+          WETH='0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
+          w3=None
+          for u in ['https://ethereum-rpc.publicnode.com','https://eth.llamarpc.com','https://1rpc.io/eth']:
+            try:
+              c=Web3(Web3.HTTPProvider(u,request_kwargs={'timeout':60}));latest=c.eth.block_number;w3=c;print('RPC|%s|latest=%s'%(u,latest));break
+            except Exception as e:print('RPC_FAIL|%s|%r'%(u,e))
+          if w3 is None:raise SystemExit('no rpc')
+          abi=[{'type':'function','name':'balanceOf','stateMutability':'view','inputs':[{'name':'account','type':'address'}],'outputs':[{'type':'uint256'}]}]
+          bal=w3.eth.contract(address=Web3.to_checksum_address(WETH),abi=abi).functions.balanceOf(Web3.to_checksum_address(A)).call()
+          print('BALANCE|WETH=%s'%(Decimal(bal)/Decimal(10**18)))
+          topic0=Web3.keccak(text='Transfer(address,address,uint256)').hex()
+          topic1='0x'+'0'*24+A[2:].lower()
+          logs=[]
+          start=25700000
+          for a in range(start,latest+1,500):
+            b=min(latest,a+499)
+            try:logs.extend(w3.eth.get_logs({'fromBlock':a,'toBlock':b,'address':Web3.to_checksum_address(WETH),'topics':[topic0,topic1]}))
+            except Exception as e:print('LOG_FAIL|%s|%s|%r'%(a,b,e))
+          print('LOG_COUNT|%s'%len(logs))
+          for lg in logs:
+            to='0x'+lg['topics'][2].hex()[-40:]
+            amt=int.from_bytes(HexBytes(lg['data']),'big')
+            block=w3.eth.get_block(lg['blockNumber']);ts=int(block['timestamp']);j=datetime.fromtimestamp(ts,timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')
+            tx=w3.eth.get_transaction(lg['transactionHash'])
+            print('TRANSFER|jst=%s|block=%s|amount=%s|to=%s|tx=%s|top_from=%s|top_to=%s|input4=%s'%(j,lg['blockNumber'],Decimal(amt)/Decimal(10**18),to,lg['transactionHash'].hex(),tx['from'].lower(),tx['to'].lower() if tx['to'] else None,tx['input'].hex()[:10]))
+          PY

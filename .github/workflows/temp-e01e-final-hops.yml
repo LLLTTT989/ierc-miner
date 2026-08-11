@@ -1,0 +1,105 @@
+name: Temporary E01e final hops
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-e01e-final-hops.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trace final custody hops
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests,time,json
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          getcontext().prec=90
+          ADDRS=[
+            '0x619292ee01ed59285bcdd7f4b9c5fa662e15f8a3',
+            '0x00f3ac32a2d174606927eb17a5d0d221c13e434a',
+            '0x1a84cacbd22316d2bac927f62a9ee3fc8da61256',
+          ]
+          CUT='2026-08-07T00:00:00.000000Z';B='https://eth.blockscout.com/api/v2'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):
+            for i in range(5):
+              r=s.get(B+path,params=p,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def j(st):return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST') if st else '-'
+          def lab(x):
+            x=x or {};z=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):z.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for y in x.get(k) or []:
+                if isinstance(y,dict):
+                  v=y.get('display_name') or y.get('name') or y.get('label')
+                  if v:z.append(str(v))
+            m=x.get('metadata') or {}
+            if isinstance(m,dict) and m.get('name'):z.append(str(m['name']))
+            return ';'.join(dict.fromkeys(z)) or '-'
+          def amount(q):
+            total=q.get('total') or {};tok=q.get('token') or {};dec=int(total.get('decimals',tok.get('decimals',0)) or 0)
+            return Decimal(str(total.get('value') or 0))/(Decimal(10)**dec)
+          def rate(q):
+            try:return Decimal(str((q.get('token') or {}).get('exchange_rate') or 0))
+            except:return Decimal(0)
+          def sym(q):return str((q.get('token') or {}).get('symbol') or '?')
+          def pages(path,base=None,maxp=35):
+            base=dict(base or {});p=base.copy();out=[]
+            for page in range(1,maxp+1):
+              d=g(path,p);items=d.get('items') or []
+              if not items:break
+              oldest=None
+              for q in items:
+                st=q.get('timestamp');oldest=st or oldest
+                if st and st>=CUT:out.append(q)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+              p={**base,**n}
+            return out
+          for addr in ADDRS:
+            info=g('/addresses/'+addr)
+            print('ADDRESS|address=%s|contract=%s|name=%s|label=%s|creator=%s|creation_tx=%s'%(addr,info.get('is_contract'),info.get('name'),lab(info),h(info.get('creator_address_hash') if isinstance(info.get('creator_address_hash'),dict) else {}),info.get('creation_tx_hash')))
+            holds=g(f'/addresses/{addr}/tokens',{'type':'ERC-20'}).get('items') or []
+            for x in holds:
+              tok=x.get('token') or {};dec=int(tok.get('decimals') or 0);amt=Decimal(str(x.get('value') or 0))/(Decimal(10)**dec);usd=amt*Decimal(str(tok.get('exchange_rate') or 0))
+              if amt:print('HOLD|address=%s|symbol=%s|amount=%s|usd=%s|token=%s'%(addr,tok.get('symbol'),amt,usd,tok.get('address_hash')))
+            # Scan transactions sent by this address.
+            txs=pages(f'/addresses/{addr}/transactions',maxp=30)
+            sent=[x for x in txs if h(x.get('from'))==addr]
+            print('SENT_COUNT|address=%s|count=%s'%(addr,len(sent)))
+            for x in sorted(sent,key=lambda z:z.get('timestamp') or ''):
+              print('TX|from=%s|jst=%s|hash=%s|to=%s|contract=%s|label=%s|method=%s|status=%s|value=%s'%(addr,j(x.get('timestamp')),x.get('hash'),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('method'),x.get('status'),x.get('value')))
+              try:d=g('/transactions/'+x['hash'])
+              except Exception:continue
+              for q in d.get('token_transfers') or []:
+                if h(q.get('from'))==addr:
+                  print('TX_TOKEN|from=%s|jst=%s|symbol=%s|amount=%s|usd=%s|to=%s|contract=%s|label=%s|tx=%s'%(addr,j(x.get('timestamp')),sym(q),amount(q),amount(q)*rate(q),h(q.get('to')),(q.get('to') or {}).get('is_contract'),lab(q.get('to')),x.get('hash')))
+            # Independently scan all transfer logs, avoiding endpoint filter issues.
+            transfers=pages(f'/addresses/{addr}/token-transfers',{'type':'ERC-20'},maxp=40)
+            real=[]
+            for q in transfers:
+              if h(q.get('from'))!=addr:continue
+              # Ignore zero-value and known Unicode/lookalike poisoning tokens with no price.
+              if amount(q)==0:continue
+              real.append(q)
+            agg=defaultdict(lambda:{'usd':Decimal(0),'tokens':defaultdict(Decimal),'obj':None,'first':None,'last':None,'txs':set()})
+            for q in real:
+              to=h(q.get('to'));a=agg[to];a['usd']+=amount(q)*rate(q);a['tokens'][sym(q)]+=amount(q);a['obj']=q.get('to');a['txs'].add(q.get('transaction_hash'));st=q.get('timestamp');a['first']=min(a['first'],st) if a['first'] else st;a['last']=max(a['last'],st) if a['last'] else st
+            print('REAL_OUT_COUNT|address=%s|count=%s|destinations=%s'%(addr,len(real),len(agg)))
+            for to,a in sorted(agg.items(),key=lambda z:z[1]['usd'],reverse=True):
+              print('DEST|from=%s|to=%s|contract=%s|label=%s|usd=%s|tokens=%s|txs=%s|first=%s|last=%s'%(addr,to,(a['obj'] or {}).get('is_contract'),lab(a['obj']),a['usd'],','.join('%s=%s'%z for z in sorted(a['tokens'].items())),len(a['txs']),j(a['first']),j(a['last'])))
+          PY

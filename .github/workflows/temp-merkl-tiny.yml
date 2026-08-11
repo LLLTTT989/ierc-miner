@@ -12,28 +12,30 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
-      - name: Print Aqua opportunity metadata
+      - name: Print recent address activity
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, urllib.request
-          ids=['5490720203734741256','1942106033834367501','10318209568612169509','10469843149341784141','7958717034974323448','16080672482593513037','15798041110823402464','17613018327580788554']
+          import json, urllib.request, urllib.parse
+          address='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          distributor='0x3ef3d8ba38ebe18db133cec108f4d14ce00dd9ae'
+          urls=[
+            ('TX',f'https://eth.blockscout.com/api/v2/addresses/{address}/transactions'),
+            ('TOKEN',f'https://eth.blockscout.com/api/v2/addresses/{address}/token-transfers?type=ERC-20'),
+          ]
           def get(url):
             req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
             with urllib.request.urlopen(req,timeout=45) as r: return r.status,json.loads(r.read())
-          for oid in ids:
-            found=None
-            for url in [f'https://api.merkl.xyz/v4/opportunities/{oid}',f'https://api.merkl.xyz/v4/opportunities?id={oid}&campaigns=true']:
-              try:
-                status,data=get(url)
-                if isinstance(data,list): data=data[0] if data else None
-                if isinstance(data,dict): found=(url,status,data); break
-              except Exception as exc: print('OPP_FAIL|id=%s|url=%s|error=%r' % (oid,url,exc))
-            if not found: continue
-            url,status,o=found
-            chain=o.get('chain') or {}; protocol=o.get('protocol') or o.get('mainProtocol') or {}; tokens=o.get('tokens') or []
-            print('OPPORTUNITY|id=%s|status=%s|url=%s|name=%s|status_field=%s|chain_id=%s|chain_name=%s|protocol=%s|action=%s|type=%s|tokens=%s|explorer=%s' % (
-              oid,status,url,o.get('name') or o.get('title'),o.get('status'),chain.get('id') or o.get('chainId'),chain.get('name'),protocol.get('id') or protocol.get('name') or o.get('mainProtocolId'),o.get('action'),o.get('type'),','.join(str((x or {}).get('symbol') or (x or {}).get('address')) for x in tokens if isinstance(x,dict)),o.get('explorerAddress')))
-            print('OPP_KEYS|id=%s|keys=%s' % (oid,','.join(sorted(o.keys()))))
+          for kind,url in urls:
+            try: status,data=get(url); print('HTTP|%s|%s|%s' % (kind,status,url))
+            except Exception as exc: print('FAIL|%s|%r' % (kind,exc)); continue
+            items=data.get('items',[]) if isinstance(data,dict) else []
+            print('COUNT|%s|%s' % (kind,len(items)))
+            for x in items[:50]:
+              if kind=='TX':
+                print('TX|timestamp=%s|hash=%s|from=%s|to=%s|method=%s|status=%s|value=%s' % (x.get('timestamp'),x.get('hash'),(x.get('from') or {}).get('hash'),(x.get('to') or {}).get('hash'),x.get('method'),x.get('status'),x.get('value')))
+              else:
+                frm=((x.get('from') or {}).get('hash') or '').lower(); to=((x.get('to') or {}).get('hash') or '').lower(); tok=x.get('token') or {}
+                print('TOKEN|timestamp=%s|tx=%s|symbol=%s|total=%s|from=%s|to=%s|is_distributor=%s' % (x.get('timestamp'),x.get('transaction_hash'),tok.get('symbol'),json.dumps(x.get('total'),separators=(',',':')),frm,to,frm==distributor))
           PY

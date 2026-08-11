@@ -1,0 +1,82 @@
+name: Temporary follow E01e recipients
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-follow-e01e-two.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Follow recipient wallets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import requests,time
+          from collections import defaultdict
+          from decimal import Decimal,getcontext
+          from datetime import datetime,timezone,timedelta
+          getcontext().prec=80
+          ADDRS=['0x456b99ff0a1459a9016a37b41cce5937dbc8bd8e','0x00f3ac32a2d174606927eb17a5d0d221c13e434a']
+          CUT='2026-08-08T00:00:00.000000Z';B='https://eth.blockscout.com/api/v2'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def g(path,p=None):
+            for i in range(5):
+              r=s.get(B+path,params=p,timeout=60)
+              if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+              r.raise_for_status();return r.json()
+            raise RuntimeError(path)
+          def pages(path,p=None,maxp=30):
+            base=dict(p or {});q=base.copy();o=[]
+            for _ in range(maxp):
+              d=g(path,q);it=d.get('items') or []
+              if not it:break
+              oldest=None
+              for x in it:
+                st=x.get('timestamp');oldest=st or oldest
+                if not st or st>=CUT:o.append(x)
+              n=d.get('next_page_params')
+              if not isinstance(n,dict) or not n or (oldest and oldest<CUT):break
+              q={**base,**n}
+            return o
+          def h(x):return ((x or {}).get('hash') or '').lower() if isinstance(x,dict) else ''
+          def lab(x):
+            x=x or {};z=[]
+            for k in ('name','ens_domain_name','implementation_name'):
+              if x.get(k):z.append(str(x[k]))
+            for k in ('public_tags','watchlist_names'):
+              for y in x.get(k) or []:
+                if isinstance(y,dict):
+                  v=y.get('display_name') or y.get('name') or y.get('label')
+                  if v:z.append(str(v))
+            m=x.get('metadata') or {}
+            if isinstance(m,dict) and m.get('name'):z.append(str(m['name']))
+            return ';'.join(dict.fromkeys(z)) or '-'
+          def amt(x):
+            q=x.get('total') or {};t=x.get('token') or {};return Decimal(str(q.get('value') or 0))/(Decimal(10)**int(q.get('decimals',t.get('decimals',0)) or 0))
+          def rate(x):
+            try:return Decimal(str((x.get('token') or {}).get('exchange_rate') or 0))
+            except:return Decimal(0)
+          def sy(x):return str((x.get('token') or {}).get('symbol') or '?')
+          def j(st):return datetime.fromisoformat(st.replace('Z','+00:00')).astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST') if st else '-'
+          for src in ADDRS:
+            info=g('/addresses/'+src);print('ADDRESS|address=%s|contract=%s|name=%s|tags=%s|coin_balance=%s'%(src,info.get('is_contract'),info.get('name'),lab(info),info.get('coin_balance')))
+            holds=g('/addresses/'+src+'/tokens',{'type':'ERC-20'}).get('items') or []
+            for x in holds:
+              t=x.get('token') or {};d=int(t.get('decimals') or 0);v=Decimal(str(x.get('value') or 0))/(Decimal(10)**d);u=v*Decimal(str(t.get('exchange_rate') or 0))
+              if v and u>=Decimal('1'):print('HOLD|address=%s|symbol=%s|amount=%s|usd=%s'%(src,t.get('symbol'),v,u))
+            out=[x for x in pages('/addresses/'+src+'/token-transfers',{'type':'ERC-20','filter':'from'}) if h(x.get('from'))==src]
+            agg=defaultdict(lambda:{'usd':Decimal(0),'tok':defaultdict(Decimal),'obj':None,'tx':set(),'first':None,'last':None})
+            for x in out:
+              to=h(x.get('to'));a=agg[to];a['usd']+=amt(x)*rate(x);a['tok'][sy(x)]+=amt(x);a['obj']=x.get('to');a['tx'].add(x.get('transaction_hash'));st=x.get('timestamp');a['first']=min(a['first'],st) if a['first'] else st;a['last']=max(a['last'],st) if a['last'] else st
+            print('OUT_SUMMARY|from=%s|transfer_count=%s|destinations=%s'%(src,len(out),len(agg)))
+            for to,a in sorted(agg.items(),key=lambda z:z[1]['usd'],reverse=True)[:40]:print('DEST|from=%s|to=%s|contract=%s|label=%s|usd=%s|tokens=%s|txs=%s|first=%s|last=%s'%(src,to,(a['obj'] or {}).get('is_contract'),lab(a['obj']),a['usd'],','.join('%s=%s'%z for z in sorted(a['tok'].items())),len(a['tx']),j(a['first']),j(a['last'])))
+            for x in sorted(out,key=lambda z:z.get('timestamp') or ''):
+              if amt(x)*rate(x)>=Decimal('1000'):print('LARGE|from=%s|jst=%s|symbol=%s|amount=%s|usd=%s|to=%s|contract=%s|label=%s|tx=%s'%(src,j(x.get('timestamp')),sy(x),amt(x),amt(x)*rate(x),h(x.get('to')),(x.get('to') or {}).get('is_contract'),lab(x.get('to')),x.get('transaction_hash')))
+          PY

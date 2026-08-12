@@ -1,0 +1,164 @@
+name: Temporary Aqua fast range decode
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-range-fast.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Decode top address strategy ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, math, requests, statistics, time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal, getcontext
+          getcontext().prec=100
+          URL='https://api.1inch.com/mcp/protocol'
+          ADDRS=[
+            ('1','0xe22259232b3cf5c74104cf2ded7f878f0201b198'),('2','0x3bb5c8a00190da68059f0f66c24794584eb10d07'),
+            ('3','0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'),('4','0x50e01433711f0cde93d09856405f64a579fa5244'),
+            ('5','0x5510accff071694262fcb4dc317bf65a02aaf4f8'),('6','0xa0996c6e3d6525b80873fa5ef6b39f7468fb90f4'),
+            ('7','0x3e716f13cd4ec7bfc39917f3416a94bf5eec11b5'),('8','0xfff80decd0d72e544caa334fb78c0f5ab1d139f9'),
+            ('9','0x8b02c84ba7fbaae14a7e13a48cccede55854c55b'),('10','0x3ca3018ea93d19f14bb447aa1b02f0b6378edb1a'),
+            ('12/F594','0xf5947f530b2a67b3d9ef211c10abba06c6c3a836')]
+          NOW=datetime.now(timezone.utc);CUTOFF=int((NOW-timedelta(days=7)).timestamp())
+          s=requests.Session();s.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-fast-range/1.0'})
+          sid=None;rid=0;ver='2025-11-25'
+          def parse(body,i):
+            msgs=[];buf=[]
+            for line in body.splitlines()+['']:
+              if not line:
+                if buf:
+                  p='\n'.join(buf);buf=[]
+                  if p!='[DONE]':msgs.append(json.loads(p))
+              elif line.startswith('data:'):buf.append(line[5:].lstrip())
+            for m in msgs:
+              if str(m.get('id'))==str(i):return m
+            raise RuntimeError('missing response')
+          def req(method,params,notify=False):
+            global sid,rid
+            if notify:p={'jsonrpc':'2.0','method':method,'params':params};i=None
+            else:rid+=1;i=rid;p={'jsonrpc':'2.0','id':i,'method':method,'params':params}
+            for n in range(6):
+              h={'MCP-Protocol-Version':ver};
+              if sid:h['Mcp-Session-Id']=sid
+              try:
+                r=s.post(URL,json=p,headers=h,timeout=90)
+                if r.status_code==429 or r.status_code>=500:time.sleep(n+1);continue
+                r.raise_for_status()
+                if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+                if notify:return
+                e=parse(r.text,i)
+                if e.get('error'):raise RuntimeError(e['error'])
+                return e['result']
+              except Exception:
+                if n==5:raise
+                time.sleep(n+1)
+          req('initialize',{'protocolVersion':ver,'capabilities':{},'clientInfo':{'name':'aqua-fast-range','version':'1'}});req('notifications/initialized',{},True)
+          def call(args):
+            r=req('tools/call',{'name':'aqua','arguments':args})
+            if r.get('isError'):raise RuntimeError(r)
+            if r.get('structuredContent') is not None:return r['structuredContent']
+            for x in r.get('content') or []:
+              if isinstance(x,dict) and isinstance(x.get('text'),str):
+                try:return json.loads(x['text'])
+                except:pass
+            return r
+          def v7(it):
+            try:return float(it.get('performance',{}).get('volume',{}).get('last7d',{}).get('usd') or 0)
+            except:return 0.0
+          def lists(a,status):
+            out=[];cursor=None;seen=set()
+            for _ in range(20):
+              q={'action':'list_maker_strategies','address':a,'status':[status],'limit':100}
+              if cursor:q['cursor']=cursor
+              d=call(q);items=d.get('items') or []
+              if not items:break
+              out+=items;cursor=d.get('nextCursor')
+              if not cursor or cursor in seen:break
+              seen.add(cursor)
+              if status=='closed' and all(int(x.get('closedAt') or 0)<CUTOFF and int(x.get('openedAt') or 0)<CUTOFF and v7(x)==0 for x in items):break
+            return out
+          def range_from_bytes(it):
+            try:
+              b=bytes.fromhex(str(it['strategyBytes']).removeprefix('0x'))
+              n=int.from_bytes(b[128:160],'big');prog=b[160:160+n]
+              if len(prog)<114:return None
+              a=int.from_bytes(prog[50:82],'big');z=int.from_bytes(prog[82:114],'big')
+              if a<=0 or z<=0:return None
+              lo=min(a,z);hi=max(a,z)
+              rawlo=(Decimal(lo)/Decimal(10**18))**2;rawhi=(Decimal(hi)/Decimal(10**18))**2
+              toks=it.get('tokens') or []
+              if len(toks)<2:return None
+              t0,t1=toks[0],toks[1];ad0=str(t0.get('address') or '').lower();ad1=str(t1.get('address') or '').lower()
+              d0=int((t0.get('meta') or {}).get('decimals') or 18);d1=int((t1.get('meta') or {}).get('decimals') or 18)
+              s0=str((t0.get('meta') or {}).get('symbol') or ad0);s1=str((t1.get('meta') or {}).get('symbol') or ad1)
+              if int(ad0,16)<int(ad1,16):
+                # raw is token1/token0 in base units.
+                p0=rawlo*(Decimal(10)**(d0-d1));p1=rawhi*(Decimal(10)**(d0-d1));quote=s1
+              else:
+                # raw is token0/token1; invert to token1/token0, reversing bounds.
+                gtlo=rawlo*(Decimal(10)**(d1-d0));gthi=rawhi*(Decimal(10)**(d1-d0));p0=Decimal(1)/gthi;p1=Decimal(1)/gtlo;quote=s1
+              mid=(p0+p1)/2;width=(p1-p0)/mid*Decimal(100) if mid else None
+              return {'pair':s0+'/'+s1,'quoteSymbol':quote,'min':str(p0),'max':str(p1),'mid':str(mid),'widthPct':float(width),'sqrtMin':str(lo),'sqrtMax':str(hi)}
+            except Exception as e:return {'decodeError':repr(e)}
+          def qtile(xs,p):
+            if not xs:return None
+            x=sorted(xs);q=(len(x)-1)*p;i=int(q);f=q-i
+            return x[i] if i==len(x)-1 else x[i]+(x[i+1]-x[i])*f
+          result={'snapshotUtc':NOW.isoformat(),'cutoffUtc':datetime.fromtimestamp(CUTOFF,timezone.utc).isoformat(),'addresses':[]}
+          for rank,a in ADDRS:
+            raw=lists(a,'open')+lists(a,'closed');u={}
+            for x in raw:u[(x.get('chainId'),x.get('app'),x.get('strategyHash'))]=x
+            rr=[]
+            for x in u.values():
+              op=int(x.get('openedAt') or 0);cl=int(x.get('closedAt') or 0);active=not x.get('closedAt')
+              if not (active or op>=CUTOFF or cl>=CUTOFF or v7(x)>0):continue
+              rg=range_from_bytes(x) or {}
+              toks=x.get('tokens') or []
+              row={'rank':rank,'address':a,'chainId':int(x.get('chainId') or 0),'strategyHash':x.get('strategyHash'),'openedAt':op,'closedAt':x.get('closedAt'),
+                   'status':'open' if active else 'closed','pair':rg.get('pair') or '/'.join(str((t.get('meta') or {}).get('symbol') or '?') for t in toks[:2]),
+                   'quoteSymbol':rg.get('quoteSymbol'),'rangeMin':rg.get('min'),'rangeMax':rg.get('max'),'midPrice':rg.get('mid'),'widthPct':rg.get('widthPct'),
+                   'feePercent':(x.get('classification') or {}).get('feePercent'),'state':(x.get('classification') or {}).get('state'),'volume7dUsd':v7(x),
+                   'fees7dUsd':float(x.get('performance',{}).get('fees',{}).get('last7d',{}).get('usd') or 0)}
+              rr.append(row)
+            rr.sort(key=lambda x:x['openedAt'],reverse=True)
+            pairs=defaultdict(list)
+            for x in rr:pairs[x['pair']].append(x)
+            ps=[]
+            for pair,xs in pairs.items():
+              ws=[x['widthPct'] for x in xs if x['widthPct'] is not None]
+              latest=max(xs,key=lambda x:x['openedAt'])
+              ps.append({'pair':pair,'strategies':len(xs),'active':sum(x['status']=='open' for x in xs),'opened7d':sum(x['openedAt']>=CUTOFF for x in xs),
+                         'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in xs),'volume7dUsd':sum(x['volume7dUsd'] for x in xs),
+                         'medianWidthPct':statistics.median(ws) if ws else None,'p25WidthPct':qtile(ws,.25),'p75WidthPct':qtile(ws,.75),
+                         'minWidthPct':min(ws) if ws else None,'maxWidthPct':max(ws) if ws else None,
+                         'feePercents':dict(Counter(str(x['feePercent']) for x in xs)),'latest':latest})
+            ps.sort(key=lambda x:(x['volume7dUsd'],x['strategies']),reverse=True)
+            ws=[x['widthPct'] for x in rr if x['widthPct'] is not None]
+            summary={'rank':rank,'address':a,'strategies':len(rr),'active':sum(x['status']=='open' for x in rr),'opened7d':sum(x['openedAt']>=CUTOFF for x in rr),
+                     'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in rr),'volume7dUsd':sum(x['volume7dUsd'] for x in rr),
+                     'width':{'min':min(ws) if ws else None,'p25':qtile(ws,.25),'median':statistics.median(ws) if ws else None,'p75':qtile(ws,.75),'max':max(ws) if ws else None},
+                     'feePercents':dict(Counter(str(x['feePercent']) for x in rr)),'pairs':ps,'rows':rr}
+            result['addresses'].append(summary)
+            print('SUMMARY|rank=%s|address=%s|strategies=%s|active=%s|opened7d=%s|closed7d=%s|vol7d=%.2f|widthMedian=%s|pairs=%s'%(
+              rank,a,summary['strategies'],summary['active'],summary['opened7d'],summary['closed7d'],summary['volume7dUsd'],summary['width']['median'],
+              ','.join('%s:n%s:a%s:v%.0f:w%.4f'%(p['pair'],p['strategies'],p['active'],p['volume7dUsd'],p['medianWidthPct'] or 0) for p in ps[:8])),flush=True)
+          with open('aqua_top10_ranges_fast.json','w') as f:json.dump(result,f,ensure_ascii=False,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-top10-ranges-fast
+          path: aqua_top10_ranges_fast.json
+          retention-days: 1

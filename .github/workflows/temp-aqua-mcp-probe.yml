@@ -1,0 +1,105 @@
+name: Temporary Aqua MCP probe
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-mcp-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Aqua read APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, requests, time
+          from datetime import datetime, timezone, timedelta
+
+          URL='https://api.1inch.com/mcp/protocol'
+          ADDRS=[
+            '0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950',
+            '0xe22259232b3cf5c74104cf2ded7f878f0201b198',
+          ]
+          VERSIONS=['2025-11-25','2025-06-18','2025-03-26']
+          s=requests.Session();s.headers.update({'user-agent':'aqua-range-research/1.0','accept':'application/json, text/event-stream','content-type':'application/json'})
+          sid=None;version=VERSIONS[0];rid=0
+
+          def parse(body,ctype,expected):
+            body=body.strip();msgs=[]
+            if 'text/event-stream' in ctype.lower() or body.startswith('data:'):
+              buf=[]
+              for line in body.splitlines()+['']:
+                if not line:
+                  if buf:
+                    p='\n'.join(buf);buf=[]
+                    if p!='[DONE]':msgs.append(json.loads(p))
+                elif line.startswith('data:'):buf.append(line[5:].lstrip())
+            else:
+              x=json.loads(body);msgs=x if isinstance(x,list) else [x]
+            for m in msgs:
+              if str(m.get('id'))==str(expected):return m
+            raise RuntimeError('missing response id')
+
+          def post(method,params,notify=False):
+            global rid,sid,version
+            if notify:payload={'jsonrpc':'2.0','method':method,'params':params};expected=None
+            else:
+              rid+=1;expected=rid;payload={'jsonrpc':'2.0','id':rid,'method':method,'params':params}
+            headers={'MCP-Protocol-Version':version}
+            if sid:headers['Mcp-Session-Id']=sid
+            r=s.post(URL,json=payload,headers=headers,timeout=60)
+            print('HTTP|method=%s|status=%s|type=%s'%(method,r.status_code,r.headers.get('content-type')),flush=True)
+            print('BODY_HEAD|'+r.text[:500].replace('\n',' '),flush=True)
+            r.raise_for_status()
+            if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+            if notify:return None
+            env=parse(r.text,r.headers.get('content-type',''),expected)
+            if env.get('error'):raise RuntimeError(env['error'])
+            return env.get('result')
+
+          init=None
+          for v in VERSIONS:
+            version=v;sid=None
+            try:
+              init=post('initialize',{'protocolVersion':v,'capabilities':{},'clientInfo':{'name':'aqua-range-research','version':'1.0'}})
+              version=str(init.get('protocolVersion') or v)
+              post('notifications/initialized',{},notify=True)
+              print('INITIALIZED|version=%s|session=%s'%(version,sid))
+              break
+            except Exception as e:print('INIT_FAIL|version=%s|error=%r'%(v,e))
+          if init is None:raise SystemExit('initialize failed')
+          tools=post('tools/list',{})
+          print('TOOLS|'+json.dumps([x.get('name') for x in tools.get('tools',[])],ensure_ascii=False))
+
+          def unwrap(result):
+            if result.get('isError'):raise RuntimeError(result)
+            if result.get('structuredContent') is not None:return result['structuredContent']
+            vals=[]
+            for x in result.get('content') or []:
+              t=x.get('text') if isinstance(x,dict) else None
+              if isinstance(t,str):
+                try:vals.append(json.loads(t))
+                except:pass
+            if len(vals)==1:return vals[0]
+            return vals or result
+
+          for a in ADDRS:
+            for args in [
+              {'action':'list_maker_strategies','address':a,'status':['open','closed'],'limit':100},
+              {'action':'list_maker_strategies','address':a,'limit':100},
+            ]:
+              try:
+                res=post('tools/call',{'name':'aqua','arguments':args})
+                data=unwrap(res)
+                txt=json.dumps(data,ensure_ascii=False)
+                print('LIST_OK|address=%s|args=%s|len=%s'%(a,json.dumps(args),len(txt)))
+                print('LIST_DATA|address=%s|%s'%(a,txt[:50000]))
+                break
+              except Exception as e:print('LIST_FAIL|address=%s|args=%s|error=%r'%(a,json.dumps(args),e))
+          PY

@@ -1,0 +1,204 @@
+name: Temporary Aqua remaining range analysis
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-range-rest.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Decode remaining strategy ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, math, requests, statistics, time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal, getcontext
+          getcontext().prec=100
+
+          URL='https://api.1inch.com/mcp/protocol'
+          ADDRS=[
+            ('5','0x5510accff071694262fcb4dc317bf65a02aaf4f8'),
+            ('6','0xa0996c6e3d6525b80873fa5ef6b39f7468fb90f4'),
+            ('7','0x3e716f13cd4ec7bfc39917f3416a94bf5eec11b5'),
+            ('8','0xfff80decd0d72e544caa334fb78c0f5ab1d139f9'),
+            ('9','0x8b02c84ba7fbaae14a7e13a48cccede55854c55b'),
+            ('10','0x3ca3018ea93d19f14bb447aa1b02f0b6378edb1a'),
+            ('12/F594','0xf5947f530b2a67b3d9ef211c10abba06c6c3a836'),
+          ]
+          NOW=datetime.now(timezone.utc);CUTOFF=int((NOW-timedelta(days=7)).timestamp())
+          s=requests.Session();s.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-range-rest/1.0'})
+          sid=None;rid=0;ver='2025-11-25'
+
+          def parse(body,ctype,expected):
+            body=body.strip();msgs=[]
+            if 'text/event-stream' in (ctype or '').lower() or body.startswith('data:'):
+              blocks=body.replace('\r\n','\n').split('\n\n')
+              for block in blocks:
+                data=[]
+                for line in block.split('\n'):
+                  if line.startswith('data:'):data.append(line[5:].lstrip())
+                if not data:continue
+                payload='\n'.join(data)
+                if payload=='[DONE]':continue
+                try:msgs.append(json.loads(payload))
+                except json.JSONDecodeError as exc:
+                  raise RuntimeError('bad SSE JSON len=%s head=%r tail=%r err=%s'%(len(payload),payload[:120],payload[-120:],exc))
+            else:
+              x=json.loads(body);msgs=x if isinstance(x,list) else [x]
+            for m in msgs:
+              if str(m.get('id'))==str(expected):return m
+            raise RuntimeError('missing response id=%s messages=%s'%(expected,len(msgs)))
+
+          def initialize():
+            global sid,rid
+            sid=None;rid=0
+            result=post('initialize',{'protocolVersion':ver,'capabilities':{},'clientInfo':{'name':'aqua-range-rest','version':'1'}},allow_reinit=False)
+            post('notifications/initialized',{},notify=True,allow_reinit=False)
+            return result
+
+          def post(method,params,notify=False,allow_reinit=True):
+            global sid,rid
+            if notify:payload={'jsonrpc':'2.0','method':method,'params':params};expected=None
+            else:rid+=1;expected=rid;payload={'jsonrpc':'2.0','id':expected,'method':method,'params':params}
+            last=None
+            for attempt in range(8):
+              try:
+                headers={'MCP-Protocol-Version':ver}
+                if sid:headers['Mcp-Session-Id']=sid
+                r=s.post(URL,json=payload,headers=headers,timeout=90)
+                if r.status_code==429 or r.status_code>=500:
+                  time.sleep(min(8,attempt+1));continue
+                r.raise_for_status()
+                if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+                if notify:return None
+                env=parse(r.text,r.headers.get('content-type',''),expected)
+                if env.get('error'):raise RuntimeError(env['error'])
+                return env.get('result')
+              except Exception as exc:
+                last=exc
+                print('REQUEST_RETRY|method=%s|attempt=%s|error=%r'%(method,attempt+1,exc),flush=True)
+                if allow_reinit and method!='initialize':
+                  try:initialize()
+                  except Exception as rexc:print('REINIT_FAIL|%r'%rexc,flush=True)
+                time.sleep(min(8,attempt+1))
+            raise last
+
+          initialize();print('INITIALIZED|cutoff=%s|now=%s'%(CUTOFF,NOW.isoformat()),flush=True)
+
+          def call(arguments):
+            r=post('tools/call',{'name':'aqua','arguments':arguments})
+            if isinstance(r,dict) and r.get('isError'):raise RuntimeError(r)
+            if isinstance(r,dict) and r.get('structuredContent') is not None:return r['structuredContent']
+            vals=[]
+            for x in (r.get('content') if isinstance(r,dict) else []) or []:
+              t=x.get('text') if isinstance(x,dict) else None
+              if isinstance(t,str):
+                try:vals.append(json.loads(t))
+                except json.JSONDecodeError:pass
+            if len(vals)==1:return vals[0]
+            return vals or r
+
+          def v7(it):
+            try:return float(it.get('performance',{}).get('volume',{}).get('last7d',{}).get('usd') or 0)
+            except:return 0.0
+
+          def fetch_list(address,status):
+            out=[];cursor=None;seen=set()
+            for page in range(60):
+              args={'action':'list_maker_strategies','address':address,'status':[status],'limit':25}
+              if cursor:args['cursor']=cursor
+              data=call(args);items=data.get('items') if isinstance(data,dict) else []
+              if not items:break
+              out.extend(items);cursor=data.get('nextCursor') if isinstance(data,dict) else None
+              print('PAGE|address=%s|status=%s|page=%s|items=%s|total=%s'%(address,status,page+1,len(items),len(out)),flush=True)
+              if not cursor or cursor in seen:break
+              seen.add(cursor)
+              if status=='closed' and all(int(x.get('closedAt') or 0)<CUTOFF and int(x.get('openedAt') or 0)<CUTOFF and v7(x)==0 for x in items):break
+            return out
+
+          def decode_range(it):
+            b=bytes.fromhex(str(it['strategyBytes']).removeprefix('0x'))
+            n=int.from_bytes(b[128:160],'big');prog=b[160:160+n]
+            if len(prog)<114:return None
+            smin=int.from_bytes(prog[50:82],'big');smax=int.from_bytes(prog[82:114],'big')
+            if smin<=0 or smax<=0:return None
+            lo=min(smin,smax);hi=max(smin,smax)
+            rawlo=(Decimal(lo)/Decimal(10**18))**2;rawhi=(Decimal(hi)/Decimal(10**18))**2
+            toks=it.get('tokens') or []
+            if len(toks)<2:return None
+            t0,t1=toks[0],toks[1]
+            ad0=str(t0.get('address') or '').lower();ad1=str(t1.get('address') or '').lower()
+            d0=int((t0.get('meta') or {}).get('decimals') or 18);d1=int((t1.get('meta') or {}).get('decimals') or 18)
+            s0=str((t0.get('meta') or {}).get('symbol') or ad0);s1=str((t1.get('meta') or {}).get('symbol') or ad1)
+            if int(ad0,16)<int(ad1,16):
+              pmin=rawlo*(Decimal(10)**(d0-d1));pmax=rawhi*(Decimal(10)**(d0-d1))
+            else:
+              qmin=rawlo*(Decimal(10)**(d1-d0));qmax=rawhi*(Decimal(10)**(d1-d0));pmin=Decimal(1)/qmax;pmax=Decimal(1)/qmin
+            mid=(pmin+pmax)/2;width=(pmax-pmin)/mid*Decimal(100)
+            return {'pair':s0+'/'+s1,'quoteSymbol':s1,'min':str(pmin),'max':str(pmax),'mid':str(mid),'widthPct':float(width)}
+
+          def qtile(xs,p):
+            if not xs:return None
+            x=sorted(xs);pos=(len(x)-1)*p;lo=math.floor(pos);hi=math.ceil(pos)
+            return x[lo] if lo==hi else x[lo]+(x[hi]-x[lo])*(pos-lo)
+
+          result={'snapshotUtc':NOW.isoformat(),'cutoffUtc':datetime.fromtimestamp(CUTOFF,timezone.utc).isoformat(),'addresses':[]}
+          for rank,address in ADDRS:
+            print('ADDRESS_START|rank=%s|address=%s'%(rank,address),flush=True)
+            try:raw=fetch_list(address,'open')+fetch_list(address,'closed')
+            except Exception as exc:
+              print('ADDRESS_FAIL|rank=%s|address=%s|error=%r'%(rank,address,exc),flush=True);continue
+            unique={}
+            for x in raw:unique[(x.get('chainId'),x.get('app'),x.get('strategyHash'))]=x
+            rr=[]
+            for x in unique.values():
+              opened=int(x.get('openedAt') or 0);closed=int(x.get('closedAt') or 0);active=not x.get('closedAt')
+              if not (active or opened>=CUTOFF or closed>=CUTOFF or v7(x)>0):continue
+              try:rg=decode_range(x) or {}
+              except Exception as exc:
+                print('DECODE_FAIL|address=%s|hash=%s|error=%r'%(address,x.get('strategyHash'),exc),flush=True);rg={}
+              toks=x.get('tokens') or []
+              rr.append({'rank':rank,'address':address,'chainId':int(x.get('chainId') or 0),'strategyHash':x.get('strategyHash'),'openedAt':opened,'closedAt':x.get('closedAt'),
+                         'status':'open' if active else 'closed','pair':rg.get('pair') or '/'.join(str((t.get('meta') or {}).get('symbol') or '?') for t in toks[:2]),
+                         'quoteSymbol':rg.get('quoteSymbol'),'rangeMin':rg.get('min'),'rangeMax':rg.get('max'),'midPrice':rg.get('mid'),'widthPct':rg.get('widthPct'),
+                         'feePercent':(x.get('classification') or {}).get('feePercent'),'state':(x.get('classification') or {}).get('state'),'volume7dUsd':v7(x),
+                         'fees7dUsd':float(x.get('performance',{}).get('fees',{}).get('last7d',{}).get('usd') or 0)})
+            rr.sort(key=lambda x:x['openedAt'],reverse=True)
+            grouped=defaultdict(list)
+            for x in rr:grouped[x['pair']].append(x)
+            pairs=[]
+            for pair,xs in grouped.items():
+              widths=[x['widthPct'] for x in xs if x['widthPct'] is not None]
+              latest=max(xs,key=lambda x:x['openedAt'])
+              pairs.append({'pair':pair,'strategies':len(xs),'active':sum(x['status']=='open' for x in xs),'opened7d':sum(x['openedAt']>=CUTOFF for x in xs),
+                            'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in xs),'volume7dUsd':sum(x['volume7dUsd'] for x in xs),
+                            'medianWidthPct':statistics.median(widths) if widths else None,'p25WidthPct':qtile(widths,.25),'p75WidthPct':qtile(widths,.75),
+                            'minWidthPct':min(widths) if widths else None,'maxWidthPct':max(widths) if widths else None,
+                            'feePercents':dict(Counter(str(x['feePercent']) for x in xs)),'latest':latest})
+            pairs.sort(key=lambda x:(x['volume7dUsd'],x['strategies']),reverse=True)
+            widths=[x['widthPct'] for x in rr if x['widthPct'] is not None]
+            summary={'rank':rank,'address':address,'strategies':len(rr),'active':sum(x['status']=='open' for x in rr),'opened7d':sum(x['openedAt']>=CUTOFF for x in rr),
+                     'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in rr),'volume7dUsd':sum(x['volume7dUsd'] for x in rr),
+                     'width':{'min':min(widths) if widths else None,'p25':qtile(widths,.25),'median':statistics.median(widths) if widths else None,'p75':qtile(widths,.75),'max':max(widths) if widths else None},
+                     'feePercents':dict(Counter(str(x['feePercent']) for x in rr)),'pairs':pairs,'rows':rr}
+            result['addresses'].append(summary)
+            print('SUMMARY|rank=%s|address=%s|strategies=%s|active=%s|opened7d=%s|closed7d=%s|vol7d=%.2f|widthMedian=%s|pairs=%s'%(
+              rank,address,summary['strategies'],summary['active'],summary['opened7d'],summary['closed7d'],summary['volume7dUsd'],summary['width']['median'],
+              ','.join('%s:n%s:a%s:v%.0f:w%.4f'%(p['pair'],p['strategies'],p['active'],p['volume7dUsd'],p['medianWidthPct'] or 0) for p in pairs[:10])),flush=True)
+          with open('aqua_remaining_ranges.json','w') as f:json.dump(result,f,ensure_ascii=False,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-remaining-ranges
+          path: aqua_remaining_ranges.json
+          retention-days: 1

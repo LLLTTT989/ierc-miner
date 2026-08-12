@@ -1,0 +1,236 @@
+name: Temporary Aqua top 10 range analysis
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-range-top10.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Query Aqua strategies and ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, math, requests, statistics, time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal, InvalidOperation, getcontext
+
+          getcontext().prec=80
+          URL='https://api.1inch.com/mcp/protocol'
+          ADDRESSES=[
+            ('1','0xe22259232b3cf5c74104cf2ded7f878f0201b198'),
+            ('2','0x3bb5c8a00190da68059f0f66c24794584eb10d07'),
+            ('3','0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'),
+            ('4','0x50e01433711f0cde93d09856405f64a579fa5244'),
+            ('5','0x5510accff071694262fcb4dc317bf65a02aaf4f8'),
+            ('6','0xa0996c6e3d6525b80873fa5ef6b39f7468fb90f4'),
+            ('7','0x3e716f13cd4ec7bfc39917f3416a94bf5eec11b5'),
+            ('8','0xfff80decd0d72e544caa334fb78c0f5ab1d139f9'),
+            ('9','0x8b02c84ba7fbaae14a7e13a48cccede55854c55b'),
+            ('10','0x3ca3018ea93d19f14bb447aa1b02f0b6378edb1a'),
+            ('12/F594','0xf5947f530b2a67b3d9ef211c10abba06c6c3a836'),
+          ]
+          NOW=datetime.now(timezone.utc)
+          CUTOFF=int((NOW-timedelta(days=7)).timestamp())
+          VERSIONS=['2025-11-25','2025-06-18','2025-03-26']
+          s=requests.Session();s.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-top10-range-analysis/1.0'})
+          sid=None;version=VERSIONS[0];rid=0
+
+          def parse_env(body,ctype,expected):
+            body=body.strip();msgs=[]
+            if 'text/event-stream' in (ctype or '').lower() or body.startswith('data:'):
+              buf=[]
+              for line in body.splitlines()+['']:
+                if not line:
+                  if buf:
+                    payload='\n'.join(buf);buf=[]
+                    if payload!='[DONE]':msgs.append(json.loads(payload))
+                elif line.startswith('data:'):buf.append(line[5:].lstrip())
+            else:
+              x=json.loads(body);msgs=x if isinstance(x,list) else [x]
+            for m in msgs:
+              if str(m.get('id'))==str(expected):return m
+            raise RuntimeError('missing MCP response id=%s'%expected)
+
+          def post(method,params,notify=False,tries=5):
+            global rid,sid,version
+            if notify:payload={'jsonrpc':'2.0','method':method,'params':params};expected=None
+            else:
+              rid+=1;expected=rid;payload={'jsonrpc':'2.0','id':rid,'method':method,'params':params}
+            last=None
+            for attempt in range(tries):
+              try:
+                headers={'MCP-Protocol-Version':version}
+                if sid:headers['Mcp-Session-Id']=sid
+                r=s.post(URL,json=payload,headers=headers,timeout=90)
+                if r.status_code==429 or r.status_code>=500:
+                  time.sleep(1+attempt);continue
+                r.raise_for_status()
+                if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+                if notify:return None
+                env=parse_env(r.text,r.headers.get('content-type',''),expected)
+                if env.get('error'):raise RuntimeError(env['error'])
+                return env.get('result')
+              except Exception as exc:
+                last=exc;time.sleep(0.5+attempt)
+            raise last
+
+          init=None
+          for v in VERSIONS:
+            version=v;sid=None
+            try:
+              init=post('initialize',{'protocolVersion':v,'capabilities':{},'clientInfo':{'name':'aqua-top10-range-analysis','version':'1.0'}})
+              version=str(init.get('protocolVersion') or v)
+              post('notifications/initialized',{},True)
+              break
+            except Exception as exc:print('INIT_FAIL|version=%s|error=%r'%(v,exc),flush=True)
+          if init is None:raise SystemExit('MCP initialize failed')
+          print('INITIALIZED|version=%s|cutoff=%s|now=%s'%(version,CUTOFF,NOW.isoformat()),flush=True)
+
+          def call(args):
+            r=post('tools/call',{'name':'aqua','arguments':args})
+            if isinstance(r,dict) and r.get('isError'):raise RuntimeError(r)
+            if isinstance(r,dict) and r.get('structuredContent') is not None:return r['structuredContent']
+            vals=[]
+            for x in (r.get('content') if isinstance(r,dict) else []) or []:
+              t=x.get('text') if isinstance(x,dict) else None
+              if isinstance(t,str):
+                try:vals.append(json.loads(t))
+                except:pass
+            if len(vals)==1:return vals[0]
+            return vals or r
+
+          def dec(v):
+            try:return Decimal(str(v))
+            except:return None
+
+          def vol7(item):
+            try:return Decimal(str(item.get('performance',{}).get('volume',{}).get('last7d',{}).get('usd') or 0))
+            except:return Decimal(0)
+
+          def fetch_status(address,status,max_pages=20):
+            out=[];cursor=None;seen=set()
+            for page in range(max_pages):
+              args={'action':'list_maker_strategies','address':address,'status':[status],'limit':100}
+              if cursor:args['cursor']=cursor
+              data=call(args)
+              items=data.get('items') if isinstance(data,dict) else []
+              if not items:break
+              out.extend(items)
+              cursor=data.get('nextCursor') if isinstance(data,dict) else None
+              if not cursor or cursor in seen:break
+              seen.add(cursor)
+              # Closed pages are newest first; once an entire page predates the window and has no 7d activity, stop.
+              if status=='closed':
+                if all(int(x.get('closedAt') or 0)<CUTOFF and int(x.get('openedAt') or 0)<CUTOFF and vol7(x)==0 for x in items):break
+            return out
+
+          def qtile(xs,p):
+            if not xs:return None
+            ys=sorted(xs)
+            if len(ys)==1:return ys[0]
+            pos=(len(ys)-1)*p;lo=math.floor(pos);hi=math.ceil(pos)
+            if lo==hi:return ys[lo]
+            return ys[lo]+(ys[hi]-ys[lo])*(pos-lo)
+
+          result={'snapshotUtc':NOW.isoformat(),'cutoffUtc':datetime.fromtimestamp(CUTOFF,timezone.utc).isoformat(),'addresses':[]}
+          all_rows=[]
+          for rank,address in ADDRESSES:
+            print('ADDRESS_START|rank=%s|address=%s'%(rank,address),flush=True)
+            raw=[]
+            for status in ('open','closed'):
+              try:raw.extend(fetch_status(address,status))
+              except Exception as exc:print('LIST_ERROR|address=%s|status=%s|error=%r'%(address,status,exc),flush=True)
+            uniq={}
+            for it in raw:
+              key=(int(it.get('chainId') or 0),str(it.get('app') or '').lower(),str(it.get('strategyHash') or '').lower())
+              uniq[key]=it
+            relevant=[]
+            for it in uniq.values():
+              opened=int(it.get('openedAt') or 0);closed=int(it.get('closedAt') or 0);is_open=not it.get('closedAt')
+              if is_open or opened>=CUTOFF or closed>=CUTOFF or vol7(it)>0:relevant.append(it)
+            relevant.sort(key=lambda x:int(x.get('openedAt') or 0),reverse=True)
+            rows=[]
+            for idx,it in enumerate(relevant,1):
+              args={'action':'strategy_overview','chainId':int(it['chainId']),'maker':it['maker'],'app':it['app'],'strategyHash':it['strategyHash']}
+              try:o=call(args)
+              except Exception as exc:
+                print('OVERVIEW_ERROR|address=%s|hash=%s|error=%r'%(address,it.get('strategyHash'),exc),flush=True);continue
+              toks=o.get('tokens') or it.get('tokens') or []
+              symbols=[str((t.get('meta') or {}).get('symbol') or t.get('address') or '?') for t in toks]
+              pair='/'.join(symbols[:2]) if symbols else '?'
+              pr=o.get('priceRange') or {}
+              mn=dec(pr.get('min'));mx=dec(pr.get('max'));op=dec((o.get('openingPrice') or {}).get('value'))
+              width=None;open_pos=None;mid=None
+              if mn is not None and mx is not None and mn>0 and mx>=mn:
+                mid=(mn+mx)/2
+                if mid>0:width=(mx-mn)/mid*Decimal(100)
+                if op is not None and mx>mn:open_pos=(op-mn)/(mx-mn)
+              perf=o.get('performance') or it.get('performance') or {}
+              v7=dec(((perf.get('volume') or {}).get('last7d') or {}).get('usd') or 0) or Decimal(0)
+              f7=dec(((perf.get('fees') or {}).get('last7d') or {}).get('usd') or 0) or Decimal(0)
+              init_usd=sum((dec((t.get('initialBalance') or {}).get('usd') or 0) or Decimal(0)) for t in toks)
+              current_usd=sum((dec((t.get('currentBalance') or {}).get('usd') or 0) or Decimal(0)) for t in toks)
+              row={
+                'rank':rank,'address':address,'chainId':int(it.get('chainId') or 0),'app':it.get('app'),'strategyHash':it.get('strategyHash'),
+                'openedAt':int(o.get('openedAt') or it.get('openedAt') or 0),'closedAt':o.get('closedAt') if o.get('closedAt') is not None else it.get('closedAt'),
+                'status':o.get('status') or ('closed' if it.get('closedAt') else 'open'),'pair':pair,'symbols':symbols,'quoteSymbol':pr.get('quoteSymbol'),
+                'rangeMin':str(mn) if mn is not None else None,'rangeMax':str(mx) if mx is not None else None,'openingPrice':str(op) if op is not None else None,
+                'midPrice':str(mid) if mid is not None else None,'widthPct':float(width) if width is not None else None,'openingPosition':float(open_pos) if open_pos is not None else None,
+                'feePercent':float((o.get('classification') or {}).get('feePercent')) if (o.get('classification') or {}).get('feePercent') is not None else None,
+                'state':(o.get('classification') or {}).get('state'),'volume7dUsd':float(v7),'fees7dUsd':float(f7),'initialUsd':float(init_usd),'currentUsd':float(current_usd),
+              }
+              rows.append(row);all_rows.append(row)
+              if idx%25==0:print('OVERVIEWS|address=%s|done=%s|total=%s'%(address,idx,len(relevant)),flush=True)
+              time.sleep(0.02)
+
+            widths=[r['widthPct'] for r in rows if r['widthPct'] is not None and math.isfinite(r['widthPct'])]
+            pairs=defaultdict(list)
+            for r in rows:pairs[r['pair']].append(r)
+            pair_summary=[]
+            for pair,rr in pairs.items():
+              ww=[x['widthPct'] for x in rr if x['widthPct'] is not None]
+              active=[x for x in rr if x['status']=='open']
+              latest=max(rr,key=lambda x:x['openedAt'])
+              pair_summary.append({
+                'pair':pair,'strategies':len(rr),'active':len(active),'opened7d':sum(x['openedAt']>=CUTOFF for x in rr),'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in rr),
+                'volume7dUsd':sum(x['volume7dUsd'] for x in rr),'fees7dUsd':sum(x['fees7dUsd'] for x in rr),
+                'medianWidthPct':statistics.median(ww) if ww else None,'minWidthPct':min(ww) if ww else None,'maxWidthPct':max(ww) if ww else None,
+                'feePercents':dict(Counter(str(x['feePercent']) for x in rr if x['feePercent'] is not None)),
+                'latest':{k:latest[k] for k in ('strategyHash','openedAt','status','quoteSymbol','rangeMin','rangeMax','openingPrice','widthPct','feePercent','volume7dUsd')},
+              })
+            pair_summary.sort(key=lambda x:(x['volume7dUsd'],x['strategies']),reverse=True)
+            summary={
+              'rank':rank,'address':address,'strategies':len(rows),'active':sum(r['status']=='open' for r in rows),'opened7d':sum(r['openedAt']>=CUTOFF for r in rows),
+              'closed7d':sum(bool(r['closedAt']) and int(r['closedAt'])>=CUTOFF for r in rows),'volume7dUsd':sum(r['volume7dUsd'] for r in rows),'fees7dUsd':sum(r['fees7dUsd'] for r in rows),
+              'width':{'min':min(widths) if widths else None,'p25':qtile(widths,.25),'median':statistics.median(widths) if widths else None,'p75':qtile(widths,.75),'max':max(widths) if widths else None},
+              'feePercents':dict(Counter(str(r['feePercent']) for r in rows if r['feePercent'] is not None)),'pairs':pair_summary,'rows':rows,
+            }
+            result['addresses'].append(summary)
+            print('ADDRESS_SUMMARY|rank=%s|address=%s|strategies=%s|active=%s|opened7d=%s|closed7d=%s|volume7d=%s|medianWidthPct=%s|topPairs=%s'%(
+              rank,address,summary['strategies'],summary['active'],summary['opened7d'],summary['closed7d'],round(summary['volume7dUsd'],2),summary['width']['median'],
+              ','.join('%s:%s/%s:$%.0f:w%s'%(p['pair'],p['strategies'],p['active'],p['volume7dUsd'],None if p['medianWidthPct'] is None else round(p['medianWidthPct'],4)) for p in pair_summary[:6])
+            ),flush=True)
+
+          result['global']={
+            'strategies':len(all_rows),'active':sum(r['status']=='open' for r in all_rows),'opened7d':sum(r['openedAt']>=CUTOFF for r in all_rows),
+            'closed7d':sum(bool(r['closedAt']) and int(r['closedAt'])>=CUTOFF for r in all_rows),'volume7dUsd':sum(r['volume7dUsd'] for r in all_rows),
+          }
+          with open('aqua_top10_ranges.json','w') as f:json.dump(result,f,ensure_ascii=False,indent=2)
+          print('GLOBAL|'+json.dumps(result['global'],ensure_ascii=False),flush=True)
+          PY
+      - name: Upload range data
+        uses: actions/upload-artifact@v4
+        with:
+          name: aqua-top10-ranges
+          path: aqua_top10_ranges.json
+          retention-days: 1

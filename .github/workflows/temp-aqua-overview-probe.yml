@@ -1,0 +1,61 @@
+name: Temporary Aqua overview probe
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-overview-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe strategy overview
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, requests
+          URL='https://api.1inch.com/mcp/protocol';V='2025-11-25';A='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          s=requests.Session();s.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-overview-probe'})
+          sid=None;rid=0
+          def parse(t,i):
+            msgs=[];buf=[]
+            for l in t.splitlines()+['']:
+              if not l:
+                if buf:msgs.append(json.loads('\n'.join(buf)));buf=[]
+              elif l.startswith('data:'):buf.append(l[5:].lstrip())
+            for m in msgs:
+              if str(m.get('id'))==str(i):return m
+            raise RuntimeError('missing')
+          def req(method,params,notify=False):
+            global sid,rid
+            if notify:p={'jsonrpc':'2.0','method':method,'params':params};i=None
+            else:rid+=1;i=rid;p={'jsonrpc':'2.0','id':i,'method':method,'params':params}
+            h={'MCP-Protocol-Version':V};
+            if sid:h['Mcp-Session-Id']=sid
+            r=s.post(URL,json=p,headers=h,timeout=60);r.raise_for_status()
+            if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+            if notify:return
+            e=parse(r.text,i)
+            if e.get('error'):raise RuntimeError(e['error'])
+            return e['result']
+          req('initialize',{'protocolVersion':V,'capabilities':{},'clientInfo':{'name':'probe','version':'1'}});req('notifications/initialized',{},True)
+          def call(args):
+            r=req('tools/call',{'name':'aqua','arguments':args})
+            if r.get('isError'):raise RuntimeError(r)
+            for x in r.get('content') or []:
+              if isinstance(x,dict) and isinstance(x.get('text'),str):
+                try:return json.loads(x['text'])
+                except:pass
+            return r.get('structuredContent') or r
+          data=call({'action':'list_maker_strategies','address':A,'status':['open','closed'],'limit':5})
+          print('LIST_KEYS|'+json.dumps(list(data.keys()) if isinstance(data,dict) else [],ensure_ascii=False))
+          for it in (data.get('items') or [])[:5]:
+            args={'action':'strategy_overview','chainId':it['chainId'],'maker':it['maker'],'app':it['app'],'strategyHash':it['strategyHash']}
+            try:o=call(args);print('OVERVIEW|hash=%s|data=%s'%(it['strategyHash'],json.dumps(o,ensure_ascii=False)[:40000]))
+            except Exception as e:print('OVERVIEW_FAIL|hash=%s|error=%r'%(it['strategyHash'],e))
+          PY

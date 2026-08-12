@@ -1,0 +1,178 @@
+name: Temporary Aqua top 10 aggregate
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-top10-aggregate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and aggregate Merkl Aqua leaderboards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, requests, time
+          from collections import defaultdict
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+
+          getcontext().prec = 100
+          BASE='https://api.merkl.xyz/v4'
+          ANCHOR='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          s=requests.Session(); s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+
+          def get(path, params=None):
+            url=path if path.startswith('http') else BASE+path
+            last=None
+            for i in range(6):
+              try:
+                r=s.get(url,params=params,timeout=90)
+                print('HTTP|%s|%s'%(r.status_code,r.url),flush=True)
+                if r.status_code==429 or r.status_code>=500:
+                  time.sleep(i+1);continue
+                r.raise_for_status();return r.json()
+              except Exception as e:
+                last=e;time.sleep(i+1)
+            raise last
+
+          def rows(data):
+            if isinstance(data,list):return data
+            if isinstance(data,dict):
+              for k in ('items','data','rewards','campaigns'):
+                if isinstance(data.get(k),list):return data[k]
+            return []
+
+          def page_all(path, base, maxp=60):
+            out=[]
+            for p in range(maxp):
+              d=get(path,{**base,'page':p})
+              r=rows(d)
+              if not r:break
+              out+=r
+              if len(r)<int(base.get('items',1000)):break
+            return out
+
+          def addr(v):
+            if isinstance(v,str):return v.lower()
+            if isinstance(v,dict):
+              for k in ('address','user','recipient','hash','addressHash'):
+                q=v.get(k)
+                if isinstance(q,str):return q.lower()
+            return ''
+
+          def token_obj(o):
+            for k in ('token','rewardToken'):
+              q=o.get(k) if isinstance(o,dict) else None
+              if isinstance(q,dict):return q
+            return {}
+
+          def to_human(v,dec):
+            if v is None:return Decimal(0)
+            x=str(v)
+            try:
+              d=Decimal(x)
+            except:return Decimal(0)
+            if '.' in x or 'e' in x.lower():return d
+            return d/(Decimal(10)**dec)
+
+          def walk(o,path='root'):
+            if isinstance(o,dict):
+              yield path,o
+              for k,v in o.items():yield from walk(v,path+'.'+str(k))
+            elif isinstance(o,list):
+              for i,v in enumerate(o):yield from walk(v,path+'[%s]'%i)
+
+          print('SNAPSHOT|utc=%s'%datetime.now(timezone.utc).isoformat())
+          user=get('/users/%s/rewards'%ANCHOR,{'chainId':'1','reloadChainId':'1'})
+          print('USER_TOP_TYPE|%s'%type(user).__name__)
+
+          # Identify all Aqua campaign breakdowns from the anchor address that is known to participate in every Season 1 category.
+          found={}
+          for path,o in walk(user):
+            cid=o.get('campaignId') or o.get('campaign_id')
+            if not isinstance(cid,str) or not cid.startswith('0x'):continue
+            blob=json.dumps(o,ensure_ascii=False).lower()
+            name=str(o.get('name') or o.get('opportunityName') or '')
+            # Keep all breakdowns carrying this user's known Aqua 1INCH/USDC rewards; campaign metadata is verified below.
+            sym=str(token_obj(o).get('symbol') or o.get('tokenSymbol') or '')
+            amount=o.get('amount');pending=o.get('pending')
+            key=(cid.lower(),sym.upper())
+            found[key]={'cid':cid,'symbol':sym.upper(),'path':path,'raw':o,'amount':amount,'pending':pending,'name':name}
+
+          print('RAW_CAMPAIGN_BREAKDOWNS|count=%s'%len(found))
+          for q in found.values():
+            print('RAW_BREAKDOWN|cid=%s|symbol=%s|path=%s|amount=%s|pending=%s|name=%s'%(
+              q['cid'],q['symbol'],q['path'],q['amount'],q['pending'],q['name']))
+
+          # Resolve campaign metadata, then retain only Aqua Season 1 campaigns (launch around 28 Jul 2026, Aqua/1inch opportunity).
+          campaigns=[]
+          for q in found.values():
+            try:d=get('/campaigns',{'campaignId':q['cid'],'withOpportunity':'true','items':100})
+            except Exception as e:
+              print('CAMPAIGN_META_FAIL|cid=%s|error=%r'%(q['cid'],e));continue
+            for c in rows(d):
+              if not isinstance(c,dict):continue
+              if str(c.get('campaignId') or '').lower()!=q['cid'].lower():continue
+              rt=token_obj(c);sym=str(rt.get('symbol') or q['symbol']).upper()
+              opp=c.get('opportunity') if isinstance(c.get('opportunity'),dict) else {}
+              name=str(opp.get('name') or c.get('opportunityName') or c.get('name') or '')
+              blob=json.dumps(c,ensure_ascii=False).lower()
+              start=int(c.get('startTimestamp') or 0);end=int(c.get('endTimestamp') or 0)
+              is_season=(1785000000<=start<=1785600000 and 1792500000<=end<=1794000000)
+              is_aqua=('aqua' in blob) or ('1inch' in blob and is_season)
+              if not is_season or not is_aqua or sym not in ('1INCH','USDC'):continue
+              campaigns.append({
+                'cid':q['cid'],'symbol':sym,'name':name,'chain':int(c.get('distributionChainId') or c.get('chainId') or 1),
+                'dec':int(rt.get('decimals') or (6 if sym=='USDC' else 18)),'start':start,'end':end,'dbid':c.get('id'),
+                'computeChain':c.get('computeChainId'),'rewardAddress':rt.get('address')
+              })
+
+          # Deduplicate metadata.
+          uniq={}
+          for c in campaigns:uniq[(c['chain'],c['cid'].lower(),c['symbol'])]=c
+          campaigns=list(uniq.values())
+          print('AQUA_CAMPAIGNS|count=%s'%len(campaigns))
+          for c in sorted(campaigns,key=lambda z:(z['name'],z['symbol'])):
+            print('AQUA_CAMPAIGN|name=%s|symbol=%s|campaignId=%s|dbid=%s|distributionChain=%s|computeChain=%s|start=%s|end=%s'%(
+              c['name'],c['symbol'],c['cid'],c['dbid'],c['chain'],c['computeChain'],c['start'],c['end']))
+
+          agg=defaultdict(lambda:{'1INCH':Decimal(0),'USDC':Decimal(0),'cats':defaultdict(lambda:{'1INCH':Decimal(0),'USDC':Decimal(0)})})
+          campaign_tops=[]
+          for c in campaigns:
+            try:rws=page_all('/rewards',{'chainId':c['chain'],'campaignId':c['cid'],'items':1000})
+            except Exception as e:
+              print('LEADERBOARD_FAIL|cid=%s|error=%r'%(c['cid'],e));continue
+            parsed=[]
+            for o in rws:
+              if not isinstance(o,dict):continue
+              u=addr(o.get('user') or o.get('address') or o.get('recipient'))
+              if not (u.startswith('0x') and len(u)==42):continue
+              amount=to_human(o.get('amount') or o.get('reward') or o.get('value'),c['dec'])
+              pending=to_human(o.get('pending'),c['dec'])
+              total=amount+pending
+              if total<=0:continue
+              agg[u][c['symbol']]+=total
+              agg[u]['cats'][c['name']][c['symbol']]+=total
+              parsed.append((total,u,amount,pending))
+            parsed.sort(reverse=True)
+            print('CAMPAIGN_USERS|name=%s|symbol=%s|count=%s'%(c['name'],c['symbol'],len(parsed)))
+            for rank,(total,u,a,p) in enumerate(parsed[:10],1):
+              print('CATEGORY_TOP|name=%s|symbol=%s|rank=%s|address=%s|amount=%s|pending=%s|total=%s'%(c['name'],c['symbol'],rank,u,a,p,total))
+
+          rank=[]
+          for u,d in agg.items():rank.append((d['1INCH'],d['USDC'],u,d['cats']))
+          rank.sort(key=lambda z:(z[0],z[1]),reverse=True)
+          print('GLOBAL_COUNT|%s'%len(rank))
+          for n,(one,usdc,u,cats) in enumerate(rank[:30],1):
+            parts=[]
+            for name,v in sorted(cats.items(),key=lambda kv:kv[1]['1INCH'],reverse=True):
+              if v['1INCH'] or v['USDC']:parts.append('%s=1INCH:%s,USDC:%s'%(name,v['1INCH'],v['USDC']))
+            print('GLOBAL_TOP|rank=%s|address=%s|oneInch=%s|usdc=%s|categories=%s'%(n,u,one,usdc,';'.join(parts)))
+          PY

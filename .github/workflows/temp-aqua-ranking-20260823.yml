@@ -11,26 +11,134 @@ permissions:
 jobs:
   rank:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
-      - name: Inspect current Merkl reward schema
+      - name: Aggregate current Season 1 root campaigns
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m pip install --quiet requests
           python3 - <<'PY'
-          import json, urllib.request
-          A='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
-          u='https://api.merkl.xyz/v4/users/%s/rewards?chainId=1&reloadChainId=1'%A
-          req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
-          with urllib.request.urlopen(req,timeout=60) as r:data=json.load(r)
-          text=json.dumps(data,ensure_ascii=False)
-          print('TYPE|%s|LEN|%s'%(type(data).__name__,len(text)))
-          print('HEAD|'+text[:100000])
-          def walk(x,path='root'):
-            if isinstance(x,dict):
-              if any(k in x for k in ('campaignId','campaign_id','campaign')):
-                print('OBJ|path=%s|keys=%s|campaignId=%s|token=%s|amount=%s|pending=%s'%(path,list(x.keys()),x.get('campaignId') or x.get('campaign_id') or x.get('campaign'),x.get('token') or x.get('rewardToken'),x.get('amount'),x.get('pending')))
-              for k,v in x.items():walk(v,path+'.'+str(k))
-            elif isinstance(x,list):
-              for i,v in enumerate(x):walk(v,path+'[%s]'%i)
-          walk(data)
+          import json, requests, time
+          from collections import defaultdict
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+
+          getcontext().prec = 100
+          BASE = 'https://api.merkl.xyz/v4'
+          CAMPAIGNS = [
+            # name, symbol, decimals, campaign id
+            ('Ethereum ETH & LSTs', '1INCH', 18, '0x08ae729cfcb2a339c72b029ffc9aa677ae01034bbdf700eaed44c089d10250d7'),
+            ('Ethereum ETH & LSTs', 'USDC',   6, '0x332aa7b4d20262b115f02ad7ee3c34331d3de8d6accc4bbeaffcde5820b1cf10'),
+            ('Ethereum Stablecoins', '1INCH', 18, '0xec546070fcac7ffdf7d1614f3c2fbb970bb9042237739acff9a3ea480e74513d'),
+            ('Ethereum Stablecoins', 'USDC',   6, '0xbaeed8f2f265869b22313060aaf4e75515b56d87efe4753f8416fc29e71155e8'),
+            ('Ethereum BTC wrappers', '1INCH', 18, '0xdb5426c8e2463dfba01d78049ddc592648b79b781a3371b2617fee0b982ac893'),
+            ('Ethereum BTC wrappers', 'USDC',   6, '0x6788b637064d181e1bf3ccd6db00d7e395c233bdc70006fef1b50fbabe69f54c'),
+            ('Ethereum RWA', '1INCH', 18, '0xb4d427073e86686220c267ad045f1ebe9df09ed28a54c641089ed12604c3f489'),
+            ('Ethereum RWA', 'USDC',   6, '0xfa1b8864770a45129f9c70cf34dfca9a0a3c8b9f2387b82803054e01523d4a84'),
+            ('Ethereum DeFi majors', '1INCH', 18, '0x14c8dffe7c20476c50b869c0d6571ff46de176a17d728826f1ee6717035e1283'),
+            ('Ethereum DeFi majors', 'USDC',   6, '0xab1075bd9d0ddc0b7d634063bb9937442b85c4361fb54225fabb4e6f78f826fb'),
+            ('Robinhood Chain RWA', '1INCH', 18, '0xe4fd9d0b1a9df9506a6f80996d5de93f6019b84a2f22f9e13384f65823785ee2'),
+            ('Robinhood Chain RWA', 'USDC',   6, '0x88729a8b06468d578b3b9987eaf1aab94f341585dc60c97e707993912a8342ac'),
+            ('Robinhood Chain DeFi majors', '1INCH', 18, '0x1e09931deea744ff2a4848821069bba534c9cca0029926f1f74aed1a018427c7'),
+            ('Robinhood Chain DeFi majors', 'USDC',   6, '0x1268288ff2c00343d9c3a85cf3bf30c34176895f6e8f3f4158b64aeff1bcc3d5'),
+            ('BNB Chain RWA', '1INCH', 18, '0xfadc0fc04563a5a3557f0d462d802409617f4cd24904e3589eb1066471ae09de'),
+            ('BNB Chain RWA', 'USDC',   6, '0xa8e5c5b2e734d2cf0fb9c559efbdc70e6932c83061153b667df5c8b74b454fb5'),
+          ]
+          session = requests.Session()
+          session.headers.update({'user-agent': 'Mozilla/5.0', 'accept': 'application/json'})
+
+          def get(path, params=None, tries=7):
+              last = None
+              for attempt in range(tries):
+                  try:
+                      response = session.get(BASE + path, params=params, timeout=90)
+                      if response.status_code == 429 or response.status_code >= 500:
+                          time.sleep(min(10, attempt + 1)); continue
+                      response.raise_for_status()
+                      return response.json()
+                  except Exception as exc:
+                      last = exc; time.sleep(min(10, attempt + 1))
+              raise last
+
+          def items(data):
+              if isinstance(data, list): return data
+              if isinstance(data, dict):
+                  for key in ('items', 'data', 'rewards'):
+                      if isinstance(data.get(key), list): return data[key]
+              return []
+
+          def address_of(value):
+              if isinstance(value, str): return value.lower()
+              if isinstance(value, dict):
+                  for key in ('address', 'user', 'recipient', 'hash', 'addressHash'):
+                      if isinstance(value.get(key), str): return value[key].lower()
+              return ''
+
+          def human(value, decimals):
+              if value is None: return Decimal(0)
+              text = str(value)
+              try: number = Decimal(text)
+              except Exception: return Decimal(0)
+              if '.' in text or 'e' in text.lower(): return number
+              return number / (Decimal(10) ** decimals)
+
+          aggregate = defaultdict(lambda: {
+              '1INCH': Decimal(0), 'USDC': Decimal(0),
+              'categories': defaultdict(lambda: {'1INCH': Decimal(0), 'USDC': Decimal(0)})
+          })
+          campaign_stats = []
+          print('SNAPSHOT|utc=%s' % datetime.now(timezone.utc).isoformat(), flush=True)
+
+          for name, symbol, decimals, campaign_id in CAMPAIGNS:
+              rows = []
+              for page in range(80):
+                  data = get('/rewards', {
+                      'items': 1000, 'page': page, 'chainId': 1, 'campaignId': campaign_id
+                  })
+                  batch = items(data)
+                  if not batch: break
+                  rows.extend(batch)
+                  if len(batch) < 1000: break
+              users = 0
+              for row in rows:
+                  if not isinstance(row, dict): continue
+                  address = address_of(row.get('user') or row.get('address') or row.get('recipient'))
+                  if not (address.startswith('0x') and len(address) == 42): continue
+                  amount = human(row.get('amount') or row.get('reward') or row.get('value'), decimals)
+                  pending = human(row.get('pending'), decimals)
+                  total = amount + pending
+                  if total <= 0: continue
+                  aggregate[address][symbol] += total
+                  aggregate[address]['categories'][name][symbol] += total
+                  users += 1
+              campaign_stats.append({'name': name, 'symbol': symbol, 'campaignId': campaign_id, 'users': users})
+              print('CAMPAIGN|name=%s|symbol=%s|users=%s|cid=%s' % (name, symbol, users, campaign_id), flush=True)
+
+          ranking = sorted(
+              [(values['1INCH'], values['USDC'], address, values['categories']) for address, values in aggregate.items()],
+              key=lambda row: (row[0], row[1]), reverse=True
+          )
+          for rank, (one, usdc, address, categories) in enumerate(ranking[:30], 1):
+              print('RANK|rank=%s|address=%s|oneInch=%s|usdc=%s' % (rank, address, one, usdc), flush=True)
+
+          result = {
+              'snapshotUtc': datetime.now(timezone.utc).isoformat(),
+              'campaigns': campaign_stats,
+              'ranking': [
+                  {
+                      'rank': rank, 'address': address, 'oneInch': str(one), 'usdc': str(usdc),
+                      'categories': {name: {k: str(v) for k, v in values.items()} for name, values in categories.items()}
+                  }
+                  for rank, (one, usdc, address, categories) in enumerate(ranking[:50], 1)
+              ]
+          }
+          with open('aqua_ranking_20260823.json', 'w') as handle:
+              json.dump(result, handle, ensure_ascii=False, indent=2)
           PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-ranking-20260823
+          path: aqua_ranking_20260823.json
+          retention-days: 2

@@ -1,0 +1,237 @@
+name: Temporary Aqua current top 10 strategies v2
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-current-top10-20260823-v2.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Query verified campaign roots and strategy analytics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, math, requests, statistics, time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal, getcontext
+          getcontext().prec=100
+          MERKL='https://api.merkl.xyz/v4';MCP='https://api.1inch.com/mcp/protocol'
+          NOW=datetime.now(timezone.utc);CUTOFF=int((NOW-timedelta(days=7)).timestamp())
+          CHAINS={1:'Ethereum',56:'BNB Chain',4663:'Robinhood Chain',8453:'Base',42161:'Arbitrum',10:'Optimism',137:'Polygon',43114:'Avalanche',146:'Sonic',130:'Unichain'}
+          CAMPAIGNS=[
+            ('Ethereum BTC wrappers','1INCH','0xdb5426c8e2463dfba01d78049ddc592648b79b781a3371b2617fee0b982ac893',18),
+            ('Robinhood DeFi majors','1INCH','0x1e09931deea744ff2a4848821069bba534c9cca0029926f1f74aed1a018427c7',18),
+            ('Ethereum DeFi majors','1INCH','0x14c8dffe7c20476c50b869c0d6571ff46de176a17d728826f1ee6717035e1283',18),
+            ('BNB Chain RWA','1INCH','0xfadc0fc04563a5a3557f0d462d802409617f4cd24904e3589eb1066471ae09de',18),
+            ('Ethereum RWA','1INCH','0xb4d427073e86686220c267ad045f1ebe9df09ed28a54c641089ed12604c3f489',18),
+            ('Ethereum Stablecoins','1INCH','0xec546070fcac7ffdf7d1614f3c2fbb970bb9042237739acff9a3ea480e74513d',18),
+            ('Ethereum ETH & LSTs','1INCH','0x08ae729cfcb2a339c72b029ffc9aa677ae01034bbdf700eaed44c089d10250d7',18),
+            ('Robinhood RWA','1INCH','0xe4fd9d0b1a9df9506a6f80996d5de93f6019b84a2f22f9e13384f65823785ee2',18),
+            ('Ethereum BTC wrappers','USDC','0x6788b637064d181e1bf3ccd6db00d7e395c233bdc70006fef1b50fbabe69f54c',6),
+            ('Robinhood DeFi majors','USDC','0x1268288ff2c00343d9c3a85cf3bf30c34176895f6e8f3f4158b64aeff1bcc3d5',6),
+            ('Ethereum DeFi majors','USDC','0xab1075bd9d0ddc0b7d634063bb9937442b85c4361fb54225fabb4e6f78f826fb',6),
+            ('BNB Chain RWA','USDC','0xa8e5c5b2e734d2cf0fb9c559efbdc70e6932c83061153b667df5c8b74b454fb5',6),
+            ('Ethereum RWA','USDC','0xfa1b8864770a45129f9c70cf34dfca9a0a3c8b9f2387b82803054e01523d4a84',6),
+            ('Ethereum Stablecoins','USDC','0xbaeed8f2f265869b22313060aaf4e75515b56d87efe4753f8416fc29e71155e8',6),
+            ('Ethereum ETH & LSTs','USDC','0x332aa7b4d20262b115f02ad7ee3c34331d3de8d6accc4bbeaffcde5820b1cf10',6),
+            ('Robinhood RWA','USDC','0x88729a8b06468d578b3b9987eaf1aab94f341585dc60c97e707993912a8342ac',6),
+          ]
+          s=requests.Session();s.headers.update({'user-agent':'aqua-top10-v2/20260823','accept':'application/json, text/event-stream, */*'})
+          def get(url,p=None,tries=8):
+            last=None
+            for i in range(tries):
+              try:
+                r=s.get(url,params=p,timeout=90)
+                if r.status_code==429 or r.status_code>=500:time.sleep(min(10,i+1));continue
+                r.raise_for_status();return r.json()
+              except Exception as e:last=e;time.sleep(min(10,i+1))
+            raise RuntimeError(f'GET {url}: {last}')
+          def itemlist(x):
+            if isinstance(x,list):return x
+            if isinstance(x,dict):
+              for k in ('items','data','rewards'):
+                if isinstance(x.get(k),list):return x[k]
+            return []
+          def reward_pages(cid):
+            out=[]
+            for page in range(100):
+              rows=[x for x in itemlist(get(MERKL+'/rewards',{'chainId':1,'campaignId':cid,'items':1000,'page':page})) if isinstance(x,dict)]
+              if not rows:break
+              out+=rows
+              if len(rows)<1000:break
+            return out
+          def address(v):
+            if isinstance(v,str):return v.lower()
+            if isinstance(v,dict):
+              for k in ('address','user','recipient','hash','addressHash'):
+                q=v.get(k)
+                if isinstance(q,str):return q.lower()
+                if isinstance(q,dict):
+                  z=address(q)
+                  if z:return z
+            return ''
+          def human(v,d):
+            if v is None:return Decimal(0)
+            t=str(v)
+            try:x=Decimal(t)
+            except:return Decimal(0)
+            return x if ('.' in t or 'e' in t.lower()) else x/(Decimal(10)**d)
+          agg=defaultdict(lambda:{'1INCH':Decimal(0),'USDC':Decimal(0),'categories':defaultdict(lambda:{'1INCH':Decimal(0),'USDC':Decimal(0)})})
+          for name,sym,cid,dec in CAMPAIGNS:
+            rows=reward_pages(cid);n=0
+            for row in rows:
+              u=address(row.get('user') or row.get('address') or row.get('recipient'))
+              if not (u.startswith('0x') and len(u)==42):continue
+              total=human(row.get('amount') or row.get('reward') or row.get('value'),dec)+human(row.get('pending'),dec)
+              if total<=0:continue
+              agg[u][sym]+=total;agg[u]['categories'][name][sym]+=total;n+=1
+            print('CAMPAIGN',name,sym,'rows',n,flush=True)
+          ranking=[]
+          for u,d in agg.items():ranking.append({'address':u,'oneInch':d['1INCH'],'usdc':d['USDC'],'categories':d['categories']})
+          ranking.sort(key=lambda x:(x['oneInch'],x['usdc']),reverse=True)
+          for i,x in enumerate(ranking,1):x['rank']=i
+          top=ranking[:10];print('TOP10',[(x['rank'],x['address'],str(x['oneInch']),str(x['usdc'])) for x in top],flush=True)
+
+          ms=requests.Session();ms.headers.update({'accept':'application/json, text/event-stream','content-type':'application/json','user-agent':'aqua-top10-v2/20260823'})
+          sid=None;rid=0;proto='2025-11-25'
+          def parse(body,ctype,expected):
+            text=body.strip().replace('\r\n','\n');msgs=[]
+            if 'text/event-stream' in (ctype or '').lower() or text.startswith('data:'):
+              for block in text.split('\n\n'):
+                ds=[line[5:].lstrip() for line in block.split('\n') if line.startswith('data:')]
+                if ds:
+                  p='\n'.join(ds)
+                  if p!='[DONE]':msgs.append(json.loads(p))
+            else:
+              z=json.loads(text);msgs=z if isinstance(z,list) else [z]
+            for m in msgs:
+              if str(m.get('id'))==str(expected):return m
+            raise RuntimeError('missing MCP response')
+          def post(method,params,notify=False,tries=8):
+            global sid,rid,proto
+            if notify:payload={'jsonrpc':'2.0','method':method,'params':params};expected=None
+            else:rid+=1;expected=rid;payload={'jsonrpc':'2.0','id':expected,'method':method,'params':params}
+            last=None
+            for i in range(tries):
+              try:
+                h={'MCP-Protocol-Version':proto}
+                if sid:h['Mcp-Session-Id']=sid
+                r=ms.post(MCP,json=payload,headers=h,timeout=120)
+                if r.status_code==429 or r.status_code>=500:time.sleep(min(10,i+1));continue
+                r.raise_for_status()
+                if r.headers.get('mcp-session-id'):sid=r.headers['mcp-session-id']
+                if notify:return None
+                e=parse(r.text,r.headers.get('content-type',''),expected)
+                if e.get('error'):raise RuntimeError(e['error'])
+                return e.get('result')
+              except Exception as e:last=e;time.sleep(min(10,i+1))
+            raise RuntimeError(f'MCP {method}: {last}')
+          def init():
+            global sid,rid,proto
+            sid=None;rid=0
+            x=post('initialize',{'protocolVersion':proto,'capabilities':{},'clientInfo':{'name':'aqua-top10-v2','version':'1'}})
+            if isinstance(x,dict) and x.get('protocolVersion'):proto=str(x['protocolVersion'])
+            post('notifications/initialized',{},True)
+          init()
+          def aqua(args):
+            r=post('tools/call',{'name':'aqua','arguments':args})
+            if isinstance(r,dict) and r.get('isError'):raise RuntimeError(r)
+            if isinstance(r,dict) and r.get('structuredContent') is not None:return r['structuredContent']
+            vals=[]
+            for x in (r.get('content') if isinstance(r,dict) else []) or []:
+              if isinstance(x,dict) and isinstance(x.get('text'),str):
+                try:vals.append(json.loads(x['text']))
+                except:pass
+            return vals[0] if len(vals)==1 else (vals or r)
+          def volume(x):
+            try:return float(x.get('performance',{}).get('volume',{}).get('last7d',{}).get('usd') or 0)
+            except:return 0.0
+          def fees(x):
+            try:return float(x.get('performance',{}).get('fees',{}).get('last7d',{}).get('usd') or 0)
+            except:return 0.0
+          def fetch(addr_,status):
+            out=[];cursor=None;seen=set()
+            for page in range(100):
+              q={'action':'list_maker_strategies','address':addr_,'status':[status],'limit':100}
+              if cursor:q['cursor']=cursor
+              try:d=aqua(q)
+              except Exception as e:print('PAGE_RETRY',addr_,status,page,repr(e),flush=True);init();d=aqua(q)
+              rows=d.get('items') if isinstance(d,dict) else []
+              if not rows:break
+              out+=rows;nxt=d.get('nextCursor') if isinstance(d,dict) else None
+              if not nxt or nxt in seen:break
+              seen.add(nxt);cursor=nxt
+              if status=='closed' and all(int(z.get('openedAt') or 0)<CUTOFF and int(z.get('closedAt') or 0)<CUTOFF and volume(z)==0 for z in rows):break
+            return out
+          def qtile(xs,p):
+            if not xs:return None
+            x=sorted(xs);pos=(len(x)-1)*p;lo=math.floor(pos);hi=math.ceil(pos)
+            return x[lo] if lo==hi else x[lo]+(x[hi]-x[lo])*(pos-lo)
+          def decode(x):
+            try:
+              b=bytes.fromhex(str(x['strategyBytes']).removeprefix('0x'));n=int.from_bytes(b[128:160],'big');prog=b[160:160+n]
+              if len(prog)<114:return None
+              a=int.from_bytes(prog[50:82],'big');z=int.from_bytes(prog[82:114],'big')
+              if a<=0 or z<=0:return None
+              lo,hi=min(a,z),max(a,z);rlo=(Decimal(lo)/Decimal(10**18))**2;rhi=(Decimal(hi)/Decimal(10**18))**2
+              t0,t1=x['tokens'][:2];a0=str(t0['address']).lower();a1=str(t1['address']).lower();m0=t0.get('meta') or {};m1=t1.get('meta') or {};s0=str(m0.get('symbol') or a0);s1=str(m1.get('symbol') or a1);d0=int(m0.get('decimals') or 18);d1=int(m1.get('decimals') or 18)
+              if int(a0,16)<int(a1,16):mn=rlo*Decimal(10)**(d0-d1);mx=rhi*Decimal(10)**(d0-d1)
+              else:qlo=rlo*Decimal(10)**(d1-d0);qhi=rhi*Decimal(10)**(d1-d0);mn=Decimal(1)/qhi;mx=Decimal(1)/qlo
+              pair=f'{s0}/{s1}';quote=s1
+              if s1.upper()=='1INCH' and s0.upper()!='1INCH':mn,mx=Decimal(1)/mx,Decimal(1)/mn;pair=f'1INCH/{s0}';quote=s0
+              elif s0.upper()=='1INCH':pair=f'1INCH/{s1}';quote=s1
+              mid=(mn+mx)/2;return {'pair':pair,'quote':quote,'min':str(mn),'max':str(mx),'widthPct':float((mx-mn)/mid*100)}
+            except:return None
+          def mode(rows,key):
+            vals=[str(x.get(key)) for x in rows if x.get(key) is not None]
+            if not vals:return None
+            v=Counter(vals).most_common(1)[0][0]
+            try:return float(v)
+            except:return v
+          analyses=[]
+          for rankrow in top:
+            addr_=rankrow['address'];print('ADDRESS_START',rankrow['rank'],addr_,flush=True)
+            try:raw=fetch(addr_,'open')+fetch(addr_,'closed')
+            except Exception as e:analyses.append({'rank':rankrow['rank'],'address':addr_,'error':repr(e)});print('ADDRESS_FAIL',addr_,repr(e));continue
+            uniq={(x.get('chainId'),x.get('app'),x.get('strategyHash')):x for x in raw};rows=[]
+            for x in uniq.values():
+              op=int(x.get('openedAt') or 0);cl=int(x.get('closedAt') or 0);active=not x.get('closedAt');v=volume(x)
+              if not(active or op>=CUTOFF or cl>=CUTOFF or v>0):continue
+              rg=decode(x) or {};tokens=x.get('tokens') or [];fallback='/'.join(str((t.get('meta') or {}).get('symbol') or '?') for t in tokens[:2]);cid=int(x.get('chainId') or 0);c=x.get('classification') or {}
+              rows.append({'chainId':cid,'chain':CHAINS.get(cid,f'Chain {cid}'),'strategyHash':x.get('strategyHash'),'openedAt':op,'closedAt':x.get('closedAt'),'status':'open' if active else 'closed','pair':rg.get('pair') or fallback,'quoteSymbol':rg.get('quote'),'rangeMin':rg.get('min'),'rangeMax':rg.get('max'),'widthPct':rg.get('widthPct'),'feePercent':c.get('feePercent'),'state':c.get('state'),'volume7dUsd':v,'fees7dUsd':fees(x)})
+            pg=defaultdict(list);cg=defaultdict(list)
+            for x in rows:pg[(x['chain'],x['pair'])].append(x);cg[x['chain']].append(x)
+            pairs=[]
+            for (ch,pair),xs in pg.items():
+              widths=[x['widthPct'] for x in xs if x['widthPct'] is not None];opens=[x for x in xs if x['status']=='open'];latest=max(opens or xs,key=lambda x:x['openedAt'])
+              pairs.append({'chain':ch,'pair':pair,'strategies':len(xs),'active':len(opens),'opened7d':sum(x['openedAt']>=CUTOFF for x in xs),'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in xs),'volume7dUsd':sum(x['volume7dUsd'] for x in xs),'fees7dUsd':sum(x['fees7dUsd'] for x in xs),'medianWidthPct':statistics.median(widths) if widths else None,'p25WidthPct':qtile(widths,.25),'p75WidthPct':qtile(widths,.75),'minWidthPct':min(widths) if widths else None,'maxWidthPct':max(widths) if widths else None,'feeModePercent':mode(xs,'feePercent'),'latest':latest})
+            pairs.sort(key=lambda x:(x['volume7dUsd'],x['strategies']),reverse=True)
+            chains=[]
+            for ch,xs in cg.items():chains.append({'chain':ch,'strategies':len(xs),'active':sum(x['status']=='open' for x in xs),'opened7d':sum(x['openedAt']>=CUTOFF for x in xs),'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in xs),'volume7dUsd':sum(x['volume7dUsd'] for x in xs)})
+            chains.sort(key=lambda x:x['volume7dUsd'],reverse=True);widths=[x['widthPct'] for x in rows if x['widthPct'] is not None]
+            summary={'rank':rankrow['rank'],'address':addr_,'reward1INCH':str(rankrow['oneInch']),'rewardUSDC':str(rankrow['usdc']),'categories':rankrow['categories'],'strategies':len(rows),'active':sum(x['status']=='open' for x in rows),'opened7d':sum(x['openedAt']>=CUTOFF for x in rows),'closed7d':sum(bool(x['closedAt']) and int(x['closedAt'])>=CUTOFF for x in rows),'volume7dUsd':sum(x['volume7dUsd'] for x in rows),'fees7dUsd':sum(x['fees7dUsd'] for x in rows),'widthStats':{'min':min(widths) if widths else None,'p25':qtile(widths,.25),'median':statistics.median(widths) if widths else None,'p75':qtile(widths,.75),'max':max(widths) if widths else None},'feeModePercent':mode(rows,'feePercent'),'pairs':pairs,'chains':chains,'rows':rows}
+            analyses.append(summary);print('SUMMARY',summary['rank'],addr_,'active',summary['active'],'opened7d',summary['opened7d'],'closed7d',summary['closed7d'],'volume',round(summary['volume7dUsd'],2),'median',summary['widthStats']['median'],'pairs',[(p['pair'],round(p['volume7dUsd']),p['medianWidthPct'],p['active']) for p in pairs[:6]],flush=True)
+          def conv(x):
+            if isinstance(x,Decimal):return str(x)
+            if isinstance(x,defaultdict):return {k:conv(v) for k,v in x.items()}
+            if isinstance(x,dict):return {str(k):conv(v) for k,v in x.items()}
+            if isinstance(x,list):return [conv(v) for v in x]
+            return x
+          result={'snapshotUtc':NOW.isoformat(),'snapshotJst':NOW.astimezone(timezone(timedelta(hours=9))).isoformat(),'cutoffUtc':datetime.fromtimestamp(CUTOFF,timezone.utc).isoformat(),'campaigns':[{'name':n,'symbol':s,'campaignId':c,'decimals':d} for n,s,c,d in CAMPAIGNS],'rankingTop20':ranking[:20],'analyses':analyses}
+          with open('aqua_current_top10_20260823.json','w') as f:json.dump(conv(result),f,ensure_ascii=False,indent=2)
+          print('REPORT_READY',flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-current-top10-20260823-v2
+          path: aqua_current_top10_20260823.json
+          retention-days: 1

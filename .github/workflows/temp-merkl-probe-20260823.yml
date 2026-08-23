@@ -1,0 +1,36 @@
+name: Temporary Merkl reward schema probe 2026-08-23
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-merkl-probe-20260823.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect response schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, urllib.request
+          A='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          u='https://api.merkl.xyz/v4/users/%s/rewards?chainId=1&reloadChainId=1'%A
+          req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
+          with urllib.request.urlopen(req,timeout=60) as r:data=json.load(r)
+          txt=json.dumps(data,ensure_ascii=False)
+          print('TYPE|%s|LEN|%s'%(type(data).__name__,len(txt)))
+          print('HEAD|'+txt[:50000])
+          def walk(x,path='root'):
+            if isinstance(x,dict):
+              if any(k in x for k in ('campaignId','campaign_id','campaign')):
+                print('OBJ|path=%s|keys=%s|campaignId=%s|token=%s|amount=%s|pending=%s'%(path,list(x.keys()),x.get('campaignId') or x.get('campaign_id') or x.get('campaign'),x.get('token') or x.get('rewardToken'),x.get('amount'),x.get('pending')))
+              for k,v in x.items():walk(v,path+'.'+str(k))
+            elif isinstance(x,list):
+              for i,v in enumerate(x):walk(v,path+'[%s]'%i)
+          walk(data)
+          PY

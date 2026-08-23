@@ -1,0 +1,107 @@
+name: Temporary Aqua ranking 2026-08-23
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/temp-aqua-ranking-20260823.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Aggregate current Season 1 rewards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet requests
+          python3 - <<'PY'
+          import json, requests, time
+          from collections import defaultdict
+          from decimal import Decimal, getcontext
+          from datetime import datetime, timezone
+          getcontext().prec=100
+          BASE='https://api.merkl.xyz/v4'
+          ANCHOR='0xe01ecff2f6c4f2416e83e6861e8abf79b1c95950'
+          s=requests.Session();s.headers.update({'user-agent':'Mozilla/5.0','accept':'application/json'})
+          def get(path,params=None):
+            last=None
+            for i in range(7):
+              try:
+                r=s.get(BASE+path,params=params,timeout=90)
+                if r.status_code==429 or r.status_code>=500:time.sleep(i+1);continue
+                r.raise_for_status();return r.json()
+              except Exception as e:last=e;time.sleep(i+1)
+            raise last
+          def rows(x):
+            if isinstance(x,list):return x
+            if isinstance(x,dict):
+              for k in ('items','data','rewards','campaigns'):
+                if isinstance(x.get(k),list):return x[k]
+            return []
+          def walk(x):
+            if isinstance(x,dict):
+              yield x
+              for v in x.values():yield from walk(v)
+            elif isinstance(x,list):
+              for v in x:yield from walk(v)
+          def tok(x):
+            if not isinstance(x,dict):return {}
+            for k in ('rewardToken','token'):
+              if isinstance(x.get(k),dict):return x[k]
+            return {}
+          def addr(x):
+            if isinstance(x,str):return x.lower()
+            if isinstance(x,dict):
+              for k in ('address','user','recipient','hash','addressHash'):
+                if isinstance(x.get(k),str):return x[k].lower()
+            return ''
+          def human(v,d):
+            if v is None:return Decimal(0)
+            z=str(v)
+            try:q=Decimal(z)
+            except:return Decimal(0)
+            return q if ('.' in z or 'e' in z.lower()) else q/(Decimal(10)**d)
+          user=get('/users/%s/rewards'%ANCHOR,{'chainId':'1','reloadChainId':'1'})
+          refs={}
+          for o in walk(user):
+            cid=o.get('campaignId') or o.get('campaign_id')
+            sy=str(tok(o).get('symbol') or o.get('tokenSymbol') or '').upper()
+            if isinstance(cid,str) and cid.startswith('0x') and sy in ('1INCH','USDC'):refs[(cid.lower(),sy)]=(cid,sy)
+          camps={}
+          for cid,sy0 in refs.values():
+            for c in rows(get('/campaigns',{'campaignId':cid,'withOpportunity':'true','items':100})):
+              if str(c.get('campaignId') or '').lower()!=cid.lower():continue
+              t=tok(c);sy=str(t.get('symbol') or sy0).upper();blob=json.dumps(c,ensure_ascii=False).lower();st=int(c.get('startTimestamp') or 0);en=int(c.get('endTimestamp') or 0)
+              if sy not in ('1INCH','USDC') or not (1785000000<=st<=1785700000 and 1792000000<=en<=1794500000) or ('aqua' not in blob and '1inch' not in blob):continue
+              opp=c.get('opportunity') if isinstance(c.get('opportunity'),dict) else {}
+              name=str(opp.get('name') or c.get('opportunityName') or c.get('name') or c.get('id') or 'Aqua')
+              chain=int(c.get('distributionChainId') or c.get('chainId') or 1);dec=int(t.get('decimals') or (6 if sy=='USDC' else 18))
+              camps[(chain,cid.lower(),sy)]={'cid':cid,'sy':sy,'chain':chain,'dec':dec,'name':name}
+          print('SNAPSHOT|%s'%datetime.now(timezone.utc).isoformat())
+          print('CAMPAIGNS|%s'%len(camps))
+          total=defaultdict(lambda:{'1INCH':Decimal(0),'USDC':Decimal(0)})
+          for c in camps.values():
+            n=0
+            for page in range(80):
+              batch=rows(get('/rewards',{'items':1000,'page':page,'chainId':c['chain'],'campaignId':c['cid']}))
+              if not batch:break
+              for o in batch:
+                u=addr(o.get('user') or o.get('address') or o.get('recipient'))
+                if not (u.startswith('0x') and len(u)==42):continue
+                q=human(o.get('amount') or o.get('reward') or o.get('value'),c['dec'])+human(o.get('pending'),c['dec'])
+                if q>0:total[u][c['sy']]+=q;n+=1
+              if len(batch)<1000:break
+            print('CAMPAIGN|name=%s|symbol=%s|users=%s|cid=%s'%(c['name'],c['sy'],n,c['cid']))
+          rank=sorted([(v['1INCH'],v['USDC'],u) for u,v in total.items()],reverse=True)
+          for i,(one,usdc,u) in enumerate(rank[:30],1):print('RANK|rank=%s|address=%s|oneInch=%s|usdc=%s'%(i,u,one,usdc))
+          with open('aqua_ranking_20260823.json','w') as f:json.dump({'snapshot':datetime.now(timezone.utc).isoformat(),'campaigns':list(camps.values()),'ranking':[{'rank':i+1,'address':u,'oneInch':str(o),'usdc':str(s)} for i,(o,s,u) in enumerate(rank[:50])]},f,ensure_ascii=False,indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-ranking-20260823
+          path: aqua_ranking_20260823.json
+          retention-days: 2

@@ -1,0 +1,30 @@
+name: Temporary Aqua top10 current 2026-08-23
+
+on:
+  pull_request:
+    paths:
+      - "tmp/aqua_top10_current_20260823.py"
+      - ".github/workflows/temp-aqua-top10-current-20260823.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet requests
+      - run: python3 tmp/aqua_top10_current_20260823.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-top10-current-20260823
+          path: |
+            aqua_top10_current_20260823.json
+            aqua_top10_current_20260823.md
+          retention-days: 1

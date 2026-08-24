@@ -1,0 +1,30 @@
+name: Temporary Aqua current top 10 strategies
+
+on:
+  pull_request:
+    paths:
+      - "tmp/aqua_current_top10_20260824.py"
+      - ".github/workflows/temp-aqua-top10-current-20260824.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet requests
+      - name: Recalculate ranking and analyze last seven days
+        run: python3 tmp/aqua_current_top10_20260824.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aqua-top10-current-strategies-20260824
+          path: |
+            aqua_top10_current_strategies.json
+            aqua_top10_current_strategies.md
+          retention-days: 1
